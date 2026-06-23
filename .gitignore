@@ -1,0 +1,7 @@
+*
+!*/
+!.gitignore
+!project/
+!project/**
+!LICENSE
+!README.md
