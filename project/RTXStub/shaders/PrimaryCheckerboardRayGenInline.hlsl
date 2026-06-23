@@ -35,6 +35,8 @@ void PrimaryCheckerboardRayGenInline(
 {
     if (any(dispatchThreadID.xy >= g_view.renderResolution)) return;
 
+    outputBufferSunLightShadow[dispatchThreadID.xy] = 0.0;
+
     RayDesc rayDesc;
     rayDesc.Direction = rayDirFromNDC(getNDCjittered(dispatchThreadID.xy));
     rayDesc.Origin = g_view.viewOriginSteveSpace;

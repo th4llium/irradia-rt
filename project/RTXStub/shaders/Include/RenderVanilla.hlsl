@@ -517,30 +517,40 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
     float3 sunDiffuse = 0;
     float3 sunSpecular = 0;
 
-    float3 directLightDirection = sampleCelestialLightDisk(
-        mainLightDir,
-        GetBlueNoise2D(rayState));
-    float NdotL_main = dot(surfaceInfo.normal, directLightDirection);
+    float NdotL_main = dot(surfaceInfo.normal, mainLightDir);
     if (NdotL_main > 0.0) {
-        
-        RayDesc shadowRay;
-        shadowRay.Origin = surfaceInfo.position + 1.0e-4 * surfaceInfo.normal;
-        shadowRay.Direction = directLightDirection;
-        shadowRay.TMin = 0.0;
-        shadowRay.TMax = 10000.0;
+        float3 shadowDirection = sampleCelestialLightDisk(
+            mainLightDir,
+            GetBlueNoise2D(rayState));
+        float3 shadowTransmission = 0.0;
+        if (dot(surfaceInfo.normal, shadowDirection) > 0.0) {
+            RayDesc shadowRay;
+            shadowRay.Origin =
+                surfaceInfo.position + 1.0e-4 * surfaceInfo.normal;
+            shadowRay.Direction = shadowDirection;
+            shadowRay.TMin = 0.0;
+            shadowRay.TMax = 10000.0;
 
-        ShadowPayload payload;
-        TraceShadowRay(shadowRay, payload);
-        float3 shadowTransmission = payload.transmission;
+            ShadowPayload payload;
+            TraceShadowRay(shadowRay, payload);
+            shadowTransmission = payload.transmission;
+        }
+
+        if (rayState.bounceCount == 0) {
+            shadowTransmission = ResolveTemporalSunShadow(
+                rayState.pixelCoord,
+                surfaceInfo.position,
+                surfaceInfo.prevPosition,
+                surfaceInfo.normal,
+                shadowTransmission);
+        }
         
         if (any(shadowTransmission > 0)) {
-            float3 L = directLightDirection;
-            float realNdotL = dot(surfaceInfo.normal, L);
-            if (realNdotL > 0.0) {
-                float3 H = safeNormalize(V + L, surfaceInfo.normal);
-                float NdotL = max(realNdotL, 0.0001);
-                float NdotH = max(dot(surfaceInfo.normal, H), 0.0);
-                float LdotH = max(dot(L, H), 0.0);
+            float3 L = mainLightDir;
+            float3 H = safeNormalize(V + L, surfaceInfo.normal);
+            float NdotL = max(NdotL_main, 0.0001);
+            float NdotH = max(dot(surfaceInfo.normal, H), 0.0);
+            float LdotH = max(dot(L, H), 0.0);
             
             float3 F = F_Schlick(max(dot(H, V), 0.0), F0);
             float D = D_GGX(NdotH, roughness);
@@ -568,8 +578,9 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
                 * shadowTransmission * NdotL * PI;
             sunDiffuse += lightContrib * diffuseBRDF;
             sunSpecular += lightContrib * specBRDF;
-            }
         }
+    } else if (rayState.bounceCount == 0) {
+        outputBufferSunLightShadow[rayState.pixelCoord] = 0.0;
     }
     
     int lightCount = min(25, g_view.cpuLightsCount);
