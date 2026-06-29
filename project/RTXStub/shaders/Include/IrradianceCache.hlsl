@@ -8,7 +8,7 @@
 #endif
 
 #ifndef IRRADIANCE_CACHE_MAX_LUMINANCE
-#define IRRADIANCE_CACHE_MAX_LUMINANCE 96.0
+#define IRRADIANCE_CACHE_MAX_LUMINANCE PERF_IRRADIANCE_CACHE_MAX_LUMINANCE
 #endif
 
 struct IrradianceCacheSample
@@ -73,7 +73,6 @@ IrradianceCacheSample SampleIncomingIrradianceCache(
         1.0 - hitInfo.barycentric2.x - hitInfo.barycentric2.y,
         hitInfo.barycentric2);
 
-    // Interpolate in quad space to avoid a seam between its two triangles.
     float2 quadUv = (hitInfo.primitiveId & 1) == 0
         ? float2(
             barycentric.y + barycentric.z,

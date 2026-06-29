@@ -1,8 +1,6 @@
 #include "Include/Generated/Signature.hlsl"
 #include "Include/DenoisingCommon.hlsl"
 
-// #define DISABLE_TEMPORAL_ACCUMULATION 1
-
 [numthreads(16, 16, 1)]
 void ReprojectSH(
     uint3 dispatchThreadID : SV_DispatchThreadID,
@@ -49,7 +47,6 @@ void ReprojectSH(
     float2 currentPixelCenter = float2(pixelPos) + 0.5;
     float2 previousPixelPos = currentPixelCenter + motionPixels;
 
-    // Reconstruct the primary hit in the previous floating-origin frame.
     float2 previousNdc = (previousPixelPos / float2(g_view.renderResolution)) * 2.0 - 1.0;
     previousNdc.y = -previousNdc.y;
     float4 expectedPreviousStevePosH = mul(

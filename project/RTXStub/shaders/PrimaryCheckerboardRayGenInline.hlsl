@@ -26,6 +26,53 @@
 #include "Include/Util.hlsl"
 #include "Include/VolumetricLighting.hlsl"
 
+uint GetPrimaryRaySeed(uint2 pixelCoord)
+{
+    uint3 noiseCoord = uint3(
+        pixelCoord % uint2(64, 32),
+        g_view.frameCount % 8);
+    float4 noise = blueNoiseTexture.Load(uint4(noiseCoord, 0));
+    uint seed =
+        (uint)(noise.x * 4294967295.0)
+        ^ (uint)(noise.y * 4294967295.0)
+        ^ (g_view.frameCount * 73856093u);
+    rand_pcg(seed);
+    return seed;
+}
+
+float2 GetPixelNdc(uint2 pixelCoord)
+{
+    float2 ndc =
+        ((float2)pixelCoord + 0.5)
+        / g_view.renderResolution
+        * 2.0
+        - 1.0;
+    ndc.y = -ndc.y;
+    return ndc;
+}
+
+bool HasInvalidPrimaryResult(
+    float3 colorEstimate,
+    float2 motionVector,
+    float pathDistance,
+    bool checkNaN)
+{
+    return checkNaN
+        ? any(isnan(colorEstimate))
+            || any(isnan(motionVector))
+            || isnan(pathDistance)
+        : any(isinf(colorEstimate))
+            || any(isinf(motionVector))
+            || isinf(pathDistance);
+}
+
+float3 GetDiagnosticCheckerboard(uint2 pixelCoord, float3 color)
+{
+    return ((pixelCoord.x / 32 + pixelCoord.y / 32) & 1)
+        ? color
+        : (0.0).xxx;
+}
+
 [numthreads(4, 8, 1)]
 void PrimaryCheckerboardRayGenInline(
     uint3 dispatchThreadID: SV_DispatchThreadID,
@@ -40,17 +87,20 @@ void PrimaryCheckerboardRayGenInline(
     RayDesc rayDesc;
     rayDesc.Direction = rayDirFromNDC(getNDCjittered(dispatchThreadID.xy));
     rayDesc.Origin = g_view.viewOriginSteveSpace;
-    rayDesc.TMin = 0; rayDesc.TMax = 10000;
+    rayDesc.TMin = 0;
+    rayDesc.TMax = 10000;
 
-    uint3 noiseCoord = uint3(dispatchThreadID.xy % uint2(64, 32), g_view.frameCount % 8);
-    float4 noise = blueNoiseTexture.Load(uint4(noiseCoord, 0));
-    uint randSeed = (uint)(noise.x * 4294967295.0) ^ (uint)(noise.y * 4294967295.0) ^ (g_view.frameCount * 73856093u);
-    rand_pcg(randSeed);
+    uint randSeed = GetPrimaryRaySeed(dispatchThreadID.xy);
 
     float pathDistance;
     float3 primaryMotion;
-    float3 diffuseIrradiance, specular, albedo, emission, normal;
-    float firstHitDist, roughness;
+    float3 diffuseIrradiance;
+    float3 specularRadiance;
+    float3 albedo;
+    float3 emission;
+    float3 normal;
+    float firstHitDistance;
+    float roughness;
     float4 incomingIrradianceCache;
     bool hitGlass;
 
@@ -60,93 +110,92 @@ void PrimaryCheckerboardRayGenInline(
         randSeed,
         kDielectricPathRefract,
         pathDistance,
-        firstHitDist,
+        firstHitDistance,
         primaryMotion,
-        diffuseIrradiance, specular, albedo, emission, normal, roughness,
-        incomingIrradianceCache, hitGlass);
+        diffuseIrradiance,
+        specularRadiance,
+        albedo,
+        emission,
+        normal,
+        roughness,
+        incomingIrradianceCache,
+        hitGlass);
 
-    if (hitGlass) {
-        float unusedPathDistance;
-        float unusedFirstHitDistance;
-        float reflectionRoughness;
-        float3 unusedMotion;
-        float3 reflectionDiffuse;
-        float3 reflectionSpecular;
-        float3 reflectionAlbedo;
-        float3 reflectionEmission;
-        float3 unusedNormal;
-        float4 unusedCache;
-        bool unusedGlassHit;
-
-        RenderRayDenoised(
-            dispatchThreadID.xy,
-            rayDesc,
-            randSeed ^ 0x9E3779B9u,
-            kDielectricPathReflect,
-            unusedPathDistance,
-            unusedFirstHitDistance,
-            unusedMotion,
-            reflectionDiffuse,
-            reflectionSpecular,
-            reflectionAlbedo,
-            reflectionEmission,
-            unusedNormal,
-            reflectionRoughness,
-            unusedCache,
-            unusedGlassHit);
-
-        float3 reflectionRadiance =
-            reflectionAlbedo * reflectionDiffuse
-            + reflectionSpecular
-            + reflectionEmission;
-        if (reflectionRoughness >= 0.12)
-            specular += reflectionRadiance;
-        else
-            emission += reflectionRadiance;
-    }
-
-    float3 primaryHitPosition = rayDesc.Origin + rayDesc.Direction * firstHitDist;
+    float primaryDepth =
+        pathDistance > 0.0
+            ? pathDistance
+            : firstHitDistance;
+    float3 primaryHitPosition =
+        rayDesc.Origin + rayDesc.Direction * primaryDepth;
     float3 previousPrimaryHitPosition =
         primaryHitPosition - primaryMotion;
     float2 motionVector =
         computeMotionVector(primaryHitPosition, primaryMotion);
-    float reprojectedPathLength = firstHitDist;
-    if (firstHitDist < 65000.0) {
+    float reprojectedPathLength = primaryDepth;
+    if (primaryDepth < 65000.0) {
         reprojectedPathLength = length(
             previousPrimaryHitPosition - g_view.previousViewOriginSteveSpace);
     }
 
-    float3 transmittance, inscatter;
-    ComputeVolumetricFog(rayDesc.Origin, rayDesc.Direction, firstHitDist, transmittance, inscatter);
+    float3 transmittance;
+    float3 inscatter;
+    ComputeVolumetricFog(
+        GetPixelNdc(dispatchThreadID.xy),
+        primaryDepth,
+        transmittance,
+        inscatter);
 
     diffuseIrradiance *= transmittance;
-    specular *= transmittance;
+    specularRadiance *= transmittance;
     emission = emission * transmittance + inscatter;
 
-    float3 combinedCheck = albedo * diffuseIrradiance + specular + emission;
-    if (any(isinf(combinedCheck))
-        || any(isinf(motionVector))
-        || isinf(pathDistance))
+    uint3 cloudNoiseCoord = uint3(
+        dispatchThreadID.xy % uint2(256, 256),
+        0);
+    float cloudDither =
+        blueNoiseTexture.Load(uint4(cloudNoiseCoord, 0)).r;
+    float cloudTransmittance;
+    float3 cloudInscatter;
+    ComputeDirectVolumetricClouds(
+        rayDesc.Origin,
+        rayDesc.Direction,
+        primaryDepth,
+        cloudDither,
+        cloudTransmittance,
+        cloudInscatter);
+    diffuseIrradiance *= cloudTransmittance;
+    specularRadiance *= cloudTransmittance;
+    emission = emission * cloudTransmittance + cloudInscatter;
+
+    float3 finalEstimate =
+        albedo * diffuseIrradiance
+        + specularRadiance
+        + emission;
+    if (HasInvalidPrimaryResult(
+        finalEstimate, motionVector, pathDistance, false))
     {
-        diffuseIrradiance = 0; specular = 0; emission = 0;
-        albedo = (dispatchThreadID.x / 32 + dispatchThreadID.y / 32) & 1 ? float3(1, 1, 0) : 0;
+        diffuseIrradiance = 0.0;
+        specularRadiance = 0.0;
+        emission = 0.0;
+        albedo = GetDiagnosticCheckerboard(dispatchThreadID.xy, float3(1, 1, 0));
     }
-    if (any(isnan(combinedCheck))
-        || any(isnan(motionVector))
-        || isnan(pathDistance))
+    if (HasInvalidPrimaryResult(
+        finalEstimate, motionVector, pathDistance, true))
     {
-        diffuseIrradiance = 0; specular = 0; emission = 0;
-        albedo = (dispatchThreadID.x / 32 + dispatchThreadID.y / 32) & 1 ? float3(1, 0, 1) : 0;
+        diffuseIrradiance = 0.0;
+        specularRadiance = 0.0;
+        emission = 0.0;
+        albedo = GetDiagnosticCheckerboard(dispatchThreadID.xy, float3(1, 0, 1));
     }
+
     const float maxLuminance = 4096.0;
-    float diffLum = dot(diffuseIrradiance, float3(0.2126, 0.7152, 0.0722));
-    if (diffLum > maxLuminance) diffuseIrradiance *= maxLuminance / diffLum;
-    
-    float specLum = dot(specular, float3(0.2126, 0.7152, 0.0722));
-    if (specLum > maxLuminance) specular *= maxLuminance / specLum;
+    diffuseIrradiance =
+        ClampIndirectRadiance(diffuseIrradiance, maxLuminance);
+    specularRadiance =
+        ClampIndirectRadiance(specularRadiance, maxLuminance);
 
     outputBufferIndirectDiffuse[dispatchThreadID.xy] = float4(diffuseIrradiance, 1.0);
-    outputBufferIndirectSpecular[dispatchThreadID.xy] = float4(specular, 1.0);
+    outputBufferIndirectSpecular[dispatchThreadID.xy] = float4(specularRadiance, 1.0);
     outputBufferNormal[dispatchThreadID.xy] = ndirToOct(normal);
     outputBufferRayThroughput[dispatchThreadID.xy] = albedo;
     outputBufferRayDirection[dispatchThreadID.xy] = float4(emission, roughness);
@@ -158,9 +207,10 @@ void PrimaryCheckerboardRayGenInline(
         float4(emission, roughness);
     outputBufferPreviousLinearRoughness[dispatchThreadID.xy] = roughness;
 
-    outputBufferFinal[dispatchThreadID.xy] = float4(albedo * diffuseIrradiance + specular + emission, 1);
+    outputBufferFinal[dispatchThreadID.xy] =
+        float4(albedo * diffuseIrradiance + specularRadiance + emission, 1);
     outputBufferMotionVectors[dispatchThreadID.xy] = motionVector;
     outputBufferReprojectedPathLength[dispatchThreadID.xy] = reprojectedPathLength;
-    outputBufferPrimaryPathLength[dispatchThreadID.xy] = firstHitDist;
+    outputBufferPrimaryPathLength[dispatchThreadID.xy] = primaryDepth;
 }
 

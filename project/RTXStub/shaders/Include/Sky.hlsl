@@ -4,236 +4,598 @@
 #include "Generated/Signature.hlsl"
 #include "Util.hlsl"
 
-// Atmosphere Constants
-#define PREVENT_CAMERA_GROUND_CLIP 
-#define AERIAL_SCALE               3.0 
-#define NIGHT_LIGHT                2e-3 
-#define SUN_DISC_SIZE              2.5 
-#define MOON_DISC_SIZE             2.4
-
-#define CITY_LIGHT_POLLUTION       float3(1.0, 0.55, 0.2)
-#define CITY_LIGHT_INTENSITY       0.025
-#define CITY_GLOW_HEIGHT           12.0
-
-#define CAM_HEIGHT                 1800.0
-#define CAM_Z                      1.4
-#define CAM_EXPOSURE               10.0
-#define CAM_AUTO_EXPOSURE_EV_LIMIT 4.0
-#define CAM_GAMMA                  2.0
-
+#define CAM_HEIGHT 1800.0
 #define INFINITY 3.402823466e38
 
-#define ATMOSPHERE_HEIGHT  100000.0
-#define ATMOSPHERE_DENSITY 1.0
-#define PLANET_RADIUS      6371000.0
-#define PLANET_CENTER      float3(0, -PLANET_RADIUS, 0)
-#define C_RAYLEIGH         (float3(5.802, 13.558, 33.100) * 1e-6)
-#define C_MIE              (float3(3.996, 3.996, 3.996) * 1e-6)
-#define C_OZONE            (float3(0.650, 1.881, 0.085) * 1e-6)
+#define SUN_DIRECT_START   -0.060
+#define SUN_DIRECT_END      0.145
+#define DAY_SKY_START      -0.145
+#define DAY_SKY_END         0.130
+#define NIGHT_START         0.070
+#define NIGHT_END          -0.160
 
-#define RAYLEIGH_MAX_LUM   2.5
-#define MIE_MAX_LUM        0.5
+#define MOON_GLOW_INTENSITY 0.18
+#define STAR_INTENSITY 1.35
 
-#define M_EXPOSURE_MUL        0.23
-#define M_FAKE_MS             0.3
-#define M_AERIAL              2.5
-#define M_TRANSMITTANCE       0.25
-#define M_LIGHT_TRANSMITTANCE 1e6
-#define M_DENSITY_HEIGHT_MOD  1e-12
-#define M_DENSITY_CAM_MOD     10.0
-#define M_OZONE               1.5
-#define M_OZONE2              5.0
-#define M_MIE                 float3(0.95, 0.85, 0.75)
+static const float3 rayleighCoeff = float3(0.27, 0.5, 1.0) * 1.0e-5;
+static const float3 mieCoeff = float3(0.5e-6, 0.5e-6, 0.5e-6);
+static const float3 totalCoeff = rayleighCoeff + mieCoeff;
+static const float sunBrightness = 3.0;
+static const float3 moonDiskColor = float3(0.78, 0.82, 0.92);
 
-float2 SphereIntersection(float3 rayStart, float3 rayDir, float3 sphereCenter, float sphereRadius) {
-    float3 oc = rayStart - sphereCenter;
-    float b = dot(oc, rayDir);
-    float c = dot(oc, oc) - sq(sphereRadius);
-    float h = sq(b) - c;
-    if (h < 0.0) return float2(-1.0, -1.0);
-    h = sqrt(h);
-    return float2(-b-h, -b+h);
-}
-float2 PlanetIntersection(float3 rayStart, float3 rayDir) {
-    return SphereIntersection(rayStart, rayDir, PLANET_CENTER, PLANET_RADIUS);
-}
-float2 AtmosphereIntersection(float3 rayStart, float3 rayDir) {
-    return SphereIntersection(rayStart, rayDir, PLANET_CENTER, PLANET_RADIUS + ATMOSPHERE_HEIGHT);
+static const float SKY_OUTPUT_SCALE = 0.5;
+
+static const float TERRAIN_SUN_ILLUMINANCE_LUX = 130000.0;
+static const float TERRAIN_FULL_MOON_ILLUMINANCE_LUX = 0.25;
+static const float TERRAIN_LUX_TO_ENGINE_RADIANCE = 1.0 / 30000.0;
+static const float3 TERRAIN_SOLAR_RGB_5778K = float3(1.0, 0.965, 0.86);
+
+static const float VL_FOG_MAX_DISTANCE = 1024.0;
+static const float VL_FOG_AIR_DENSITY = 0.023;
+static const float VL_FOG_WATER_DENSITY = 0.025;
+static const float VL_FOG_AIR_EXTINCTION_SCALE = 17.0;
+
+float GetSunAmount(float3 sunDir)
+{
+    return smoothstep(SUN_DIRECT_START, SUN_DIRECT_END, sunDir.y);
 }
 
-float PhaseR(float costh) { return (1.0+sq(costh))*0.06; }
-float PhaseM(float costh, float g) {
-    g = min(g, 0.9381);
-    float k = 1.55*g-0.55*sq(g)*g;
-    float a = 1.0-sq(k);
-    float b = 12.57*sq(1.0-k*costh);
-    return a/b;
+float GetDaySkyAmount(float3 sunDir)
+{
+    return smoothstep(DAY_SKY_START, DAY_SKY_END, sunDir.y);
 }
 
-float3 GetLightTransmittance(float3 position, float3 lightDir, float multiplier, float ozoneMultiplier) {
-    float lightExtinctionAmount = exp(-(saturate(lightDir.y + 0.05) * 40.0)) +
-        exp(-(saturate(lightDir.y + 0.5) * 5.0)) * 0.4 +
-        sq(saturate(1.0-lightDir.y)) * 0.02 + 0.002;
-    return exp(-(C_RAYLEIGH + C_MIE + C_OZONE * ozoneMultiplier) * lightExtinctionAmount * ATMOSPHERE_DENSITY * multiplier * M_LIGHT_TRANSMITTANCE);
+float GetNightAmount(float3 sunDir)
+{
+    return 1.0 - smoothstep(NIGHT_END, NIGHT_START, sunDir.y);
 }
-float3 GetLightTransmittance(float3 position, float3 lightDir) {
+
+float GetLightAboveHorizonAmount(float3 lightDir)
+{
+    return smoothstep(-0.035, 0.075, lightDir.y);
+}
+
+float GetMoonAmount(float3 sunDir, float3 moonDir)
+{
+    return GetLightAboveHorizonAmount(moonDir) * GetNightAmount(sunDir);
+}
+
+float D0(float x)
+{
+    return abs(x) + 1.0e-8;
+}
+
+float3 D0(float3 x)
+{
+    return abs(x) + 1.0e-8;
+}
+
+float3 Scatter(float3 coeff, float depth)
+{
+    return coeff * depth;
+}
+
+float3 Absorb(float3 coeff, float depth)
+{
+    return exp2(Scatter(coeff, -depth));
+}
+
+float CalcParticleThickness(float depth)
+{
+    depth = depth * 2.0;
+    depth = max(depth + 0.01, 0.01);
+    depth = 1.0 / depth;
+    return 100000.0 * depth;
+}
+
+float RayleighPhase(float x)
+{
+    return 0.375 * (1.0 + x * x);
+}
+
+float SkyHgPhase(float x, float g)
+{
+    float g2 = g * g;
+    return 0.25
+        * ((1.0 - g2)
+        * pow(1.0 + g2 - 2.0 * g * x, -1.5));
+}
+
+float MiePhaseSky(float x, float depth)
+{
+    return SkyHgPhase(x, exp2(-0.000003 * depth));
+}
+
+float3 AtmosphereSunDir(float3 sunDir)
+{
+    float y = max(sunDir.y, 0.025);
+    return normalize(float3(sunDir.x, y, sunDir.z));
+}
+
+float3 CalcAtmosphericScatter(float3 worldVector, float3 sunVector)
+{
+    float directAmount = GetSunAmount(sunVector);
+    float skyAmount = GetDaySkyAmount(sunVector);
+
+    if (skyAmount <= 0.00001) {
+        return 0.0;
+    }
+
+    float3 sunDir = AtmosphereSunDir(sunVector);
+    const float ln2 = 0.6931471805599453;
+
+    float lDotW = dot(sunDir, worldVector);
+    float lDotU = dot(sunDir, float3(0.0, 1.0, 0.0));
+    float uDotW = dot(float3(0.0, 1.0, 0.0), worldVector);
+
+    float opticalDepth = CalcParticleThickness(uDotW);
+    float opticalDepthLight = CalcParticleThickness(lDotU);
+
+    float3 scatterView = Scatter(totalCoeff, opticalDepth);
+    float3 absorbView = Absorb(totalCoeff, opticalDepth);
+
+    float3 scatterLight = Scatter(totalCoeff, opticalDepthLight);
+    float3 rawAbsorbLight = Absorb(totalCoeff, opticalDepthLight);
+
+    float3 absorbSun =
+        abs(rawAbsorbLight - absorbView)
+        / D0((scatterLight - scatterView) * ln2);
+
+    float3 mieScatter =
+        Scatter(mieCoeff, opticalDepth)
+        * MiePhaseSky(lDotW, opticalDepth);
+    float3 rayleighScatter =
+        Scatter(rayleighCoeff, opticalDepth)
+        * RayleighPhase(lDotW);
+    float3 scatterSun = mieScatter + rayleighScatter;
+
+    float3 sunSpot =
+        smoothstep(0.9999, 0.99993, lDotW)
+        * absorbView
+        * sunBrightness;
+
+    float3 skyColorNoSun =
+        scatterSun
+        * absorbSun
+        * sunBrightness
+        * skyAmount;
+
+    return skyColorNoSun + sunSpot * sunBrightness * directAmount;
+}
+
+float Hash21(float2 p)
+{
+    p = frac(p * float2(123.34, 456.21));
+    p += dot(p, p + 45.32);
+    return frac(p.x * p.y);
+}
+
+float2 SkyUV(float3 dir)
+{
+    float u = atan2(dir.z, dir.x) / (2.0 * PI) + 0.5;
+    float v = asin(clamp(dir.y, -1.0, 1.0)) / PI + 0.5;
+    return float2(u, v);
+}
+
+float GetSkyTimeSeconds()
+{
+    return (float)g_view.frameCount * (1.0 / 60.0);
+}
+
+float StarLayer(float2 uv, float scale, float threshold)
+{
+    float2 p = uv * scale;
+    float2 id = floor(p);
+    float2 gv = frac(p) - 0.5;
+
+    float rnd = Hash21(id);
+    float starMask = smoothstep(threshold, 1.0, rnd);
+
+    float d = length(gv);
+    float core = smoothstep(0.045, 0.0, d);
+
+    float twinkle =
+        0.75
+        + 0.25
+        * sin(GetSkyTimeSeconds() * (1.5 + rnd * 4.0)
+        + rnd * 6.28318);
+
+    return core * starMask * twinkle;
+}
+
+float3 RenderStars(float3 viewDir, float nightAmount)
+{
+    float2 uv = SkyUV(viewDir);
+    float horizonFade = smoothstep(-0.02, 0.18, viewDir.y);
+    float stars = 0.0;
+
+    stars += StarLayer(uv, 260.0, 0.992);
+    stars += StarLayer(uv + float2(0.37, 0.11), 420.0, 0.996) * 0.75;
+    stars += StarLayer(uv + float2(0.13, 0.71), 720.0, 0.9985) * 0.65;
+
+    return stars.xxx * STAR_INTENSITY * nightAmount * horizonFade;
+}
+
+float3 RenderMoonAndStars(float3 viewDir, float3 sunDir, float3 moonDir)
+{
+    float nightAmount = GetNightAmount(sunDir);
+    float moonAmount = GetMoonAmount(sunDir, moonDir);
+
+    float3 color = RenderStars(viewDir, nightAmount);
+
+    float mDot = dot(viewDir, moonDir);
+
+    float moonDisk = smoothstep(0.999965, 0.999990, mDot);
+
+    float moonGlowWide = pow(max(mDot, 0.0), 96.0);
+    float moonGlowTight = pow(max(mDot, 0.0), 768.0);
+    float moonGlow = moonGlowWide * 0.10 + moonGlowTight * 0.45;
+
+    color += moonDisk * moonDiskColor * 1.15 * moonAmount;
+    color += moonGlow * moonDiskColor * MOON_GLOW_INTENSITY * moonAmount;
+
+    return color;
+}
+
+float2 getRotationMatrixMult(float2 v, float angle) {
+    float c = cos(angle), s = sin(angle);
+    return float2(c * v.x - s * v.y, s * v.x + c * v.y);
+}
+
+float2 applyNoiseRotation(float2 v) {
+    return float2(v.x * 0.95534 - v.y * 0.29552, v.x * 0.29552 + v.y * 0.95534);
+}
+
+float getTriangleWave(float x) { 
+    return clamp(abs(frac(x) - 0.5), 0.01, 0.49); 
+}
+
+float2 getTriangleWave2D(float2 p) { 
+    return float2(getTriangleWave(p.x) + getTriangleWave(p.y), getTriangleWave(p.y) + getTriangleWave(p.x)); 
+}
+
+float calculateAuroraNoise(float2 position, float timeAngle) {
+    float amplitude = 1.8;
+    float shiftScale = 2.5;
+    float noiseSum = 0.0;
+    
+    position = getRotationMatrixMult(position, position.x * 0.06);
+    float2 basePosition = position;
+    
+    for (float i = 0.0; i < 3.0; i++) {
+        float2 domainShift = getTriangleWave2D(basePosition * 1.85) * 0.75;
+        domainShift = getRotationMatrixMult(domainShift, timeAngle);
+        position -= domainShift / shiftScale;
+
+        basePosition = applyNoiseRotation(basePosition * 1.618);
+        shiftScale *= 0.45;
+        amplitude *= 0.42;
+        
+        position *= 1.21 + (noiseSum - 1.0) * 0.02;
+        
+        noiseSum += getTriangleWave(position.x + getTriangleWave(position.y)) * amplitude;
+        position = -applyNoiseRotation(position);
+    }
+    
+    return clamp(1.0 / pow(max(noiseSum * 29.0, 0.0001), 1.3), 0.0, 0.55);
+}
+
+float getRayDistanceToLayer(float3 rayOrigin, float3 rayDir, float stepIndex) {
+    float heightCurve = 0.8 + pow(stepIndex, 1.4) * 0.002;
+    float perspectiveDenominator = rayDir.y * 2.0 + 0.4;
+    return (heightCurve - rayOrigin.y) / max(perspectiveDenominator, 0.0001);
+}
+
+float3 getAuroraBaseColor(float stepIndex, float noiseValue) {
+    float3 colorPhase = 1.0 - float3(2.15, -0.5, 1.2);
+    return (sin(colorPhase + stepIndex * 0.043) * 0.5 + 0.5) * noiseValue;
+}
+
+float4 renderAuroraVolumetric(float3 rayOrigin, float3 rayDir, float dither, float time) {
+    float4 accumulatedColor = 0.0;
+    float4 blurredColor = 0.0;
+    
+    const float AURORA_SPEED = 0.28;
+    const float AURORA_SCALE = 2.5;
+    
+    float timeAngle = time * AURORA_SPEED;
+    
+    const float MAX_STEPS = 20.0;
+    const float STRIDE_MULTIPLIER = 2.5;
+    
+    for(float i = 0.0; i < MAX_STEPS; i++) {
+        float jitteredStep = (i + dither) * STRIDE_MULTIPLIER; 
+        
+        float rayDist = getRayDistanceToLayer(rayOrigin, rayDir, jitteredStep);
+        float3 worldPos = rayOrigin + rayDist * rayDir;
+        float2 samplePos = worldPos.zx;
+        
+        samplePos += float2(sin(worldPos.z * 0.61803), cos(worldPos.x * 0.4321)) * 1.2;
+        
+        float noiseValue = calculateAuroraNoise(samplePos * AURORA_SCALE, timeAngle);
+        float4 stepColor = float4(getAuroraBaseColor(jitteredStep, noiseValue), noiseValue);
+        
+        blurredColor = lerp(blurredColor, stepColor, 0.6); 
+        
+        float attenuation = exp2(-jitteredStep * 0.065 - 2.5) * STRIDE_MULTIPLIER;
+        float fadeOutBottom = smoothstep(0.0, 5.0, jitteredStep);
+        
+        accumulatedColor += blurredColor * attenuation * fadeOutBottom;
+    }
+    
+    accumulatedColor *= clamp(rayDir.y * 15.0 + 0.4, 0.0, 1.0);
+    return accumulatedColor * 1.8;
+}
+
+float3 RenderEngineSky(float3 viewDir, float3 sunDir, float3 moonDir)
+{
+    float3 color = CalcAtmosphericScatter(viewDir, sunDir);
+    color += RenderMoonAndStars(viewDir, sunDir, moonDir);
+
+    float nightAmount = GetNightAmount(sunDir);
+    if (nightAmount > 0.0 && viewDir.y > 0.0) {
+        float3 rayOrigin = float3(0.0, 0.0, -6.7);
+        float2 screenPos = SkyUV(viewDir) * g_view.renderResolution;
+        float dither = blueNoiseTexture.SampleLevel(linearWrapSampler, float3(screenPos / 256.0, g_view.frameCount % 128), 0).x;
+        float4 auroraColor = renderAuroraVolumetric(rayOrigin, viewDir, dither, GetSkyTimeSeconds());
+        
+        float horizonFade = smoothstep(0.0, 0.1, viewDir.y);
+        auroraColor *= horizonFade * nightAmount;
+        
+        color = color * (1.0 - auroraColor.a) + auroraColor.rgb * 2.0;
+    }
+
+    if (any(isnan(color)) || any(isinf(color))) {
+        color = 0.0;
+    }
+
+    return max(color * SKY_OUTPUT_SCALE, 0.0);
+}
+
+float GetVolumetricFogMaxDistance()
+{
+    return min(g_view.renderDistance, VL_FOG_MAX_DISTANCE);
+}
+
+float GetVolumetricFogDensity(bool inWater)
+{
+    return inWater ? VL_FOG_WATER_DENSITY : VL_FOG_AIR_DENSITY;
+}
+
+float3 GetVolumetricFogMediaExtinction(bool inWater)
+{
+    if (inWater) {
+        return (1.0).xxx;
+    }
+
+    float3 extinction = max(
+        g_view.mediaExtinction[MEDIA_TYPE_AIR].rgb,
+        0.0);
+    return extinction * VL_FOG_AIR_EXTINCTION_SCALE;
+}
+
+float3 CalcFogTransmittance(float distance, float3 extinction)
+{
+    return exp(-extinction * distance);
+}
+
+float GetTerrainAirMass(float lightY)
+{
+    float y = clamp(lightY, 0.005, 1.0);
+    float zenithDegrees = acos(y) * (180.0 / PI);
+    return min(
+        1.0 / max(
+            y + 0.15 * pow(max(93.885 - zenithDegrees, 0.01), -1.253),
+            0.01),
+        40.0);
+}
+
+float3 GetTerrainLightTransmittance(float3 lightDir, float ozoneAmount)
+{
+    float airMass = GetTerrainAirMass(lightDir.y);
+    float extraAirMass = max(airMass - 1.0, 0.0);
+    float3 rayleighExtinction = float3(0.055, 0.125, 0.320);
+    float3 mieExtinction = (0.018).xxx;
+    float3 ozoneExtinction = float3(0.010, 0.030, 0.004) * ozoneAmount;
+    return exp(-(rayleighExtinction + mieExtinction + ozoneExtinction) * extraAirMass);
+}
+
+float3 GetLightTransmittance(
+    float3 position,
+    float3 lightDir,
+    float multiplier,
+    float ozoneMultiplier)
+{
+    return pow(
+        GetTerrainLightTransmittance(lightDir, ozoneMultiplier),
+        multiplier);
+}
+
+float3 GetLightTransmittance(float3 position, float3 lightDir)
+{
     return GetLightTransmittance(position, lightDir, 1.0, 1.0);
 }
 
-void GetRayleighMie(float opticalDepth, float densityR, float densityM, out float3 R, out float3 M) {
-    R = (1.0 - exp(-opticalDepth * densityR * C_RAYLEIGH / RAYLEIGH_MAX_LUM)) * RAYLEIGH_MAX_LUM;
-    M = (1.0 - exp(-opticalDepth * densityM * C_MIE / MIE_MAX_LUM)) * MIE_MAX_LUM;
-}
+float3 GetAtmosphere(
+    float3 rayStart,
+    float3 rayDir,
+    float rayLength,
+    float3 lightDir,
+    float3 lightColor,
+    out float4 transmittance)
+{
+    rayDir = safeNormalize(rayDir, float3(0, 1, 0));
 
-float3 GetAtmosphere(float3 rayStart, float3 rayDir, float rayLength, float3 lightDir, float3 lightColor, out float4 transmittance) {
-#ifdef PREVENT_CAMERA_GROUND_CLIP
-    rayStart.y = max(rayStart.y, 1.0);
-#endif
+    float pathScale = rayLength > 1.0e20 ? 1.0 : saturate(rayLength * 0.004);
+    float referenceSunRadiance =
+        TERRAIN_SUN_ILLUMINANCE_LUX * TERRAIN_LUX_TO_ENGINE_RADIANCE;
+    float sourceScale =
+        saturate(getLuminance(lightColor) / max(referenceSunRadiance, 1.0e-4));
 
-    float2 t1 = PlanetIntersection(rayStart, rayDir);
-    float2 t2 = AtmosphereIntersection(rayStart, rayDir);
-    float normAltitude = rayStart.y / ATMOSPHERE_HEIGHT;
+    float3 sky = CalcAtmosphericScatter(rayDir, lightDir)
+        * SKY_OUTPUT_SCALE
+        * pathScale
+        * sourceScale;
 
-    if (t2.y < 0.0) {
-        transmittance = (1.0).xxxx;
-        return (0.0).xxx;
-    } else {
-        t2.y -= max(0.0, t2.x);
-        float opticalDepth = t1.x > 0.0 ? min(t1.x, t2.y) : t2.y;
+    float opticalDepth = CalcParticleThickness(dot(float3(0.0, 1.0, 0.0), rayDir));
+    transmittance.xyz = Absorb(totalCoeff, opticalDepth * pathScale);
+    transmittance.w = smoothstep(-0.025, 0.010, rayDir.y);
 
-        opticalDepth = min(rayLength, opticalDepth);
-        opticalDepth = min(opticalDepth * M_AERIAL * AERIAL_SCALE, t2.y);
-
-        float hbias = 1.0-1.0/(2.0+sq(t2.y)*M_DENSITY_HEIGHT_MOD);
-        hbias = pow(hbias, 1.0+normAltitude*M_DENSITY_CAM_MOD); 
-        float sqhbias = sq(hbias);
-        float densityR = sqhbias * ATMOSPHERE_DENSITY;
-        float densityM = sq(sqhbias)*hbias * ATMOSPHERE_DENSITY;
-
-        float ly = clamp(lightDir.y + saturate(-lightDir.y + 0.02) * saturate(lightDir.y + 0.7), -1.0, 1.0);
-        lightColor *= GetLightTransmittance(rayStart, float3(lightDir.x, ly, lightDir.z), hbias, M_OZONE2) * PI;
-
-        float3 R, M;
-        GetRayleighMie(opticalDepth, densityR, densityM, R, M);
-        
-        float3 E = (C_RAYLEIGH * densityR + C_MIE * densityM + C_OZONE * densityR * M_OZONE) * pow4(1.0 - normAltitude) * M_TRANSMITTANCE;
-
-        float costh = dot(rayDir, lightDir);
-        float phaseR = PhaseR(costh);
-        float phaseM = PhaseM(costh, 0.88);
-        
-        float sunDownMask = smoothstep(0.1, -0.2, lightDir.y); 
-        float horizonMask = exp(-max(0.0, rayDir.y) * CITY_GLOW_HEIGHT); 
-        
-        float3 ambientNight = (NIGHT_LIGHT).xxx;
-        float3 cityGlow = CITY_LIGHT_POLLUTION * CITY_LIGHT_INTENSITY * horizonMask * sunDownMask;
-        float3 totalNightLighting = ambientNight + cityGlow;
-        
-        float3 rayleigh = (phaseR + phaseR * M_FAKE_MS) * lightColor + totalNightLighting * phaseR;
-        float3 mie = ((phaseM + phaseR * M_FAKE_MS) * lightColor + ambientNight * phaseR) * M_MIE;
-        float3 scattering = mie * M + rayleigh * R;
-
-        transmittance.xyz = exp(-(opticalDepth + pow8(opticalDepth * 4.5e-6)) * E);
-        transmittance.w = step(t1.x, 0.0);
-
-        return scattering * M_EXPOSURE_MUL;
+    if (any(isnan(sky)) || any(isinf(sky))) {
+        sky = 0.0;
     }
+
+    return max(sky, 0.0);
 }
 
-float3 GetAtmosphere(float3 rayStart, float3 rayDir, float rayLength, float3 lightDir, float3 lightColor) {
+float3 GetAtmosphere(
+    float3 rayStart,
+    float3 rayDir,
+    float rayLength,
+    float3 lightDir,
+    float3 lightColor)
+{
     float4 transmittance;
-    return GetAtmosphere(rayStart, rayDir, rayLength, lightDir, lightColor, transmittance);
+    return GetAtmosphere(
+        rayStart,
+        rayDir,
+        rayLength,
+        lightDir,
+        lightColor,
+        transmittance);
 }
 
-void GetSunColorAndLux(float3 pos, float3 sunDir, out float3 color, out float lux) {
-    float3 sunBaseRadiance = (4.0).xxx; 
-    float3 transmittance = GetLightTransmittance(pos, sunDir);
-    color = sunBaseRadiance * transmittance; 
-    lux = getLuminance(color); 
+void GetSunColorAndLux(
+    float3 pos,
+    float3 sunDir,
+    out float3 color,
+    out float lux)
+{
+    float3 transmittance = GetTerrainLightTransmittance(sunDir, 1.0);
+    float3 spectralColor = TERRAIN_SOLAR_RGB_5778K * transmittance;
+
+    lux = getLuminance(spectralColor) * TERRAIN_SUN_ILLUMINANCE_LUX;
+    color =
+        spectralColor
+        * (TERRAIN_SUN_ILLUMINANCE_LUX * TERRAIN_LUX_TO_ENGINE_RADIANCE);
 }
 
-void GetMoonColorAndLux(float3 pos, float3 sunDir, float3 moonDir, out float3 color, out float lux) {
-    float3 moonBaseRadiance = (0.005).xxx * (dot(sunDir, -moonDir) * 0.5 + 0.5);
-    float3 transmittance = GetLightTransmittance(pos, moonDir);
-    color = moonBaseRadiance * transmittance;
-    lux = getLuminance(color);
+void GetMoonColorAndLux(
+    float3 pos,
+    float3 sunDir,
+    float3 moonDir,
+    out float3 color,
+    out float lux)
+{
+    float3 transmittance = GetTerrainLightTransmittance(moonDir, 0.35);
+    float3 spectralColor = moonDiskColor * transmittance;
+
+    lux = getLuminance(spectralColor) * TERRAIN_FULL_MOON_ILLUMINANCE_LUX;
+    color =
+        spectralColor
+        * (TERRAIN_FULL_MOON_ILLUMINANCE_LUX * TERRAIN_LUX_TO_ENGINE_RADIANCE);
 }
 
-void GetSkyAmbientAndLux(float3 pos, float3 normal, float3 sunDir, float3 moonDir, out float3 color, out float lux) {
-    float4 t;
-    float3 sunAmbient = GetAtmosphere(pos, normal, INFINITY, sunDir, (1.0).xxx, t);
-    float3 moonBaseRadiance = (0.005).xxx * (dot(sunDir, -moonDir) * 0.5 + 0.5);
-    float3 moonAmbient = GetAtmosphere(pos, normal, INFINITY, moonDir, moonBaseRadiance, t);
-    color = (sunAmbient + moonAmbient) * 5.0;
-    lux = getLuminance(color);
+void GetSkyAmbientAndLux(
+    float3 pos,
+    float3 normal,
+    float3 sunDir,
+    float3 moonDir,
+    out float3 color,
+    out float lux)
+{
+    float3 zenithDir = float3(0.0, 1.0, 0.0);
+    float3 dayAmbient = CalcAtmosphericScatter(zenithDir, sunDir)
+        * SKY_OUTPUT_SCALE
+        * 1.35;
+
+    float3 nightAmbient =
+        moonDiskColor
+        * (TERRAIN_FULL_MOON_ILLUMINANCE_LUX * TERRAIN_LUX_TO_ENGINE_RADIANCE)
+        * GetMoonAmount(sunDir, moonDir)
+        * 64.0;
+
+    color = max(dayAmbient + nightAmbient, 0.0);
+    if (any(isnan(color)) || any(isinf(color))) {
+        color = 0.0;
+    }
+
+    lux = getLuminance(color) / max(TERRAIN_LUX_TO_ENGINE_RADIANCE, 1.0e-6);
 }
 
-float3 GetFogColor(float3 pos, float3 rayDir, float fogDistance, float3 sunDir, float3 moonDir) {
-    float4 t;
-    float3 sunFog = GetAtmosphere(pos, rayDir, fogDistance, sunDir, (1.0).xxx, t);
-    float3 moonBaseRadiance = (0.05).xxx * (dot(sunDir, -moonDir) * 0.5 + 0.5);
-    float3 moonFog = GetAtmosphere(pos, rayDir, fogDistance, moonDir, moonBaseRadiance, t);
-    return sunFog + moonFog;
+float3 GetFogColor(
+    float3 pos,
+    float3 rayDir,
+    float fogDistance,
+    float3 sunDir,
+    float3 moonDir)
+{
+    float3 viewDir = safeNormalize(rayDir, float3(1, 0, 0));
+    float3 horizonDir = safeNormalize(
+        float3(viewDir.x, 0.0, viewDir.z),
+        float3(1, 0, 0));
+    float fogDepth = min(max(fogDistance, 0.0), GetVolumetricFogMaxDistance());
+    float pathScale = saturate(fogDepth / max(GetVolumetricFogMaxDistance(), 1.0));
+    float3 dayFog =
+        CalcAtmosphericScatter(horizonDir, sunDir)
+        * SKY_OUTPUT_SCALE
+        * pathScale;
+    float3 nightFog =
+        moonDiskColor
+        * GetMoonAmount(sunDir, moonDir)
+        * (TERRAIN_FULL_MOON_ILLUMINANCE_LUX * TERRAIN_LUX_TO_ENGINE_RADIANCE)
+        * 32.0
+        * pathScale;
+    return max(dayFog + nightFog, 0.0);
 }
 
-float3 GetSunDisc(float3 rayDir, float3 lightDir) {
-    const float A = cos(0.00436 * SUN_DISC_SIZE);
-    float costh = dot(rayDir, lightDir);
-    float disc = sqrt(smoothstep(A, 1.0, costh));
-    return (disc).xxx;
+float3 GetTransparentEnvironmentSky(float3 rayDir)
+{
+    float3 sunDir = getOffsetTrueDirectionToSun();
+    float3 moonDir = getOffsetTrueDirectionToMoon();
+    float3 envDir = safeNormalize(rayDir, float3(0, 1, 0));
+
+    envDir.y = max(envDir.y, 0.035);
+    envDir = safeNormalize(envDir, float3(0, 1, 0));
+
+    float3 color = RenderEngineSky(envDir, sunDir, moonDir);
+    if (getLuminance(color) < 1.0e-5) {
+        float3 ambient;
+        float ambientLux;
+        GetSkyAmbientAndLux(
+            g_view.viewOriginSteveSpace,
+            float3(0, 1, 0),
+            sunDir,
+            moonDir,
+            ambient,
+            ambientLux);
+        color = max(color, ambient * 0.35);
+    }
+
+    return max(color, 0.0);
 }
 
-float GetAutoExposureMultiplier(float3 position, float3 sunDir, float3 moonDir) {
-    float3 skyAmbient;
-    float skyLux;
-    GetSkyAmbientAndLux(position, float3(0, 1, 0), sunDir, moonDir, skyAmbient, skyLux);
-    float lum = dot(skyAmbient, float3(0.3, 0.59, 0.11));
-    
-    return min(CAM_AUTO_EXPOSURE_EV_LIMIT, 0.003 / clamp(lum, 0.0002, 1.0)) * CAM_EXPOSURE;
+float3 GetSunDisc(float3 rayDir, float3 lightDir)
+{
+    float lDotW = dot(AtmosphereSunDir(lightDir), safeNormalize(rayDir, float3(0, 1, 0)));
+    return (smoothstep(0.9999, 0.99993, lDotW) * sunBrightness).xxx;
+}
+
+float GetAutoExposureMultiplier(float3 position, float3 sunDir, float3 moonDir)
+{
+    return 1.0;
 }
 
 #ifndef SKY_NO_RAY_STATE
 void RenderSky(inout RayState rayState)
 {
     if (all(rayState.throughput == 0)) return;
-    
-    float3 sunDir = getOffsetPrimaryCelestialDirection();
-    float3 moonDir = -sunDir;
-    float3 rd = rayState.rayDesc.Direction;
-    float3 ro = rayState.rayDesc.Origin;
-    ro.y = max(ro.y, CAM_HEIGHT);
 
-    float3 sunRadiance, moonRadiance;
-    float sunLux, moonLux;
-    GetSunColorAndLux(ro, sunDir, sunRadiance, sunLux);
-    GetMoonColorAndLux(ro, sunDir, moonDir, moonRadiance, moonLux);
+    float3 sunDir = getOffsetTrueDirectionToSun();
+    float3 moonDir = getOffsetTrueDirectionToMoon();
+    float3 viewDir = safeNormalize(rayState.rayDesc.Direction, float3(0, 1, 0));
 
-    float eclipse = 1.0 - smoothstep(0.9999, 1.0, dot(sunDir, moonDir));
-    sunRadiance *= lerp(1.0, sqrt(eclipse), 0.999);
-    
-    float4 transmittance;
-    float3 scattering = GetAtmosphere(ro, rd, INFINITY, sunDir, sunRadiance, transmittance);
-    
-    float3 color = 0;
-    if (rayState.bounceCount == 0) {
-        color = GetSunDisc(rd, sunDir) * 1e1 * sunRadiance;
-    }
-    
-    const float moonRadius = 1737e3 * MOON_DISC_SIZE;
-    float3 moonCenter = moonDir * 384400e3;
-    float2 moonT = SphereIntersection(ro, rd, moonCenter, moonRadius);
-    if (moonT.x > 0.0) {
-        float3 moonNormal = normalize(ro + rd * moonT.x - moonCenter);
-        color = clamp(dot(moonNormal, sunDir), 0.0, 1.0) * 0.14 * sunRadiance / PI;
-    }
-    
-    color *= transmittance.w;
-    color = color * transmittance.xyz + scattering;
-    color += GetAtmosphere(ro, rd, INFINITY, moonDir, moonRadiance);
-    
-    float exposure = rayState.globalExposure;
-    color *= exposure;
-    
+    float3 color = RenderEngineSky(viewDir, sunDir, moonDir);
     rayState.color += rayState.throughput * color;
 }
 #endif

@@ -8,7 +8,6 @@ void ReprojectSpecularOnly(
     uint3 groupID : SV_GroupID
     )
 {
-    // Use these for indexing denoisingOutputs[] or denoisingChromaAndVarianceOutputs[] arrays
     uint diffuseOutputIndex = (g_rootConstant0 >> 8) & 0xff;
     uint specularOutputIndex = (g_rootConstant0 >> 16) & 0xff;
 

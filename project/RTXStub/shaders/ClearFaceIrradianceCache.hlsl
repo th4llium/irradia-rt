@@ -8,7 +8,7 @@ void ClearFaceIrradianceCache(
     uint3 groupID : SV_GroupID
     )
 {
-    uint vertexBufferIndex = g_rootConstant0 & 0xfff; // equal to ObjectInstance.vbIdx
+    uint vertexBufferIndex = g_rootConstant0 & 0xfff;
     uint numOfFaces = g_rootConstant0 >> 12;
     uint firstFaceOffset = g_rootConstant1;
     uint faceIndex = dispatchThreadID.x;

@@ -51,6 +51,6 @@ You can install Irradia RT using a method:
 A massive thank you to the following individuals who made this project possible:
 
 *   **Veka:** For creating the foundational MCRTX shader template and providing invaluable guidance to help me understand the rendering pipeline.
-*   **Pymla:** My primary tester. Without their dedication, I would not know if my code was functioning properly or performing well.
-*   **Fewes:** For the excellent atmosphere shader code originally sourced from Shadertoy.
-*   **bwrensch:** For the beautiful AgX Minimal shader code originally sourced from Shadertoy.
+*   **Pymla and Stephen:** My primary testers. Without their dedication, I would not know if my code was functioning properly or performing well.
+*   **robobbo:** For the PBR Sky Atmosphere shader code originally sourced from Shadertoy ([link](https://www.shadertoy.com/view/MstBWs)).
+*   **Uchimura:** For the Uchimura tonemapper (HDR theory and practice - [Math](https://www.desmos.com/calculator/gslcdxvipg), [Source](https://www.slideshare.net/nikuque/hdr-theory-and-practicce-jp)).

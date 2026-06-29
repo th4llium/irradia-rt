@@ -8,7 +8,6 @@ void BlendCheckerboardFields(
     uint3 groupID : SV_GroupID
     )
 {
-    // Indices for denoisingInputs[] or denoisingOutputs[] arrays
     uint denoisingInputBufferIndex = (g_rootConstant0 >> 8) & 0xff;
     uint denoisingOutputBufferIndex = (g_rootConstant0 >> 16) & 0xff;
 }

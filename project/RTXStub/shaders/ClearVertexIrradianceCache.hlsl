@@ -8,7 +8,7 @@ void ClearVertexIrradianceCache(
     uint3 groupID : SV_GroupID
     )
 {
-    uint vertexBufferIndex = g_rootConstant0 & 0xfff; // equal to ObjectInstance.vbIdx
+    uint vertexBufferIndex = g_rootConstant0 & 0xfff;
     uint numOfVertices = g_rootConstant0 >> 12;
     uint firstVertexOffset = g_rootConstant1;
     uint vertexId = dispatchThreadID.x;

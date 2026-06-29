@@ -9,9 +9,8 @@ void BlurGradients(
     )
 {
     bool isVertical = (g_rootConstant0 >> 24) & 1;
-    uint iteration = (g_rootConstant0 >> 16) & 0xff; // draw call index, 0-3
+    uint iteration = (g_rootConstant0 >> 16) & 0xff;
 
-    // Use these values to index inputAdaptiveDenoiserGradients[] or outputAdaptiveDenoiserGradients[] arrays
     uint adaptiveDenoiserGradientsBufferFrom = g_rootConstant0 & 0xff;
     uint adaptiveDenoiserGradientsBufferTo = (g_rootConstant0 >> 8) & 0xff;
 }

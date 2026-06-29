@@ -33,7 +33,6 @@ void PreBlasSkinning(
     uint3 groupID : SV_GroupID
     )
 {
-    // Skin vertices and retain the previous position for motion vectors.
     if (dispatchThreadID.x >= g_meshSkinningData.vertexCount) return;
 
     RWByteAddressBuffer sourceBuffer =
@@ -71,7 +70,7 @@ void PreBlasSkinning(
     
     uint boneIndex = sourceBuffer.Load<uint16_t>(
         sourceAddress + g_meshSkinningData.offsetToBoneIndex);
-    if (boneIndex > 7) return; // We only have 8 bones.
+    if (boneIndex > 7) return;
     
     float4x4 bone = g_meshSkinningData.bones[boneIndex];
 

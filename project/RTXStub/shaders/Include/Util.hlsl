@@ -53,7 +53,6 @@ float3 hash32(float2 p) {
     return frac((p3.xxy+p3.yzz)*p3.zyx);
 }
 
-// Stateful PCG RNG
 uint rand_pcg(inout uint rng_state) {
     uint state = rng_state;
     rng_state = rng_state * 747796405u + 2891336453u;
@@ -93,11 +92,10 @@ float2 computeMotionVector(float3 steveSpacePosition, float3 steveSpaceMotion) {
     float4 prevClipPos = mul(float4(prevHitPos, 1), g_view.prevViewProj);
     float2 prevNdcPos = prevClipPos.xy * safeRcp(prevClipPos.w);
 
-    return (prevNdcPos - ndcPos) * float2(0.5, -0.5); // Offset in UV space.
+    return (prevNdcPos - ndcPos) * float2(0.5, -0.5);
 }
 
 float3 rayDirFromNDC(float2 ndc) {
-    // Preserve the homogeneous divide for non-zero view origins.
     const float kNdcDepth = 0.5;
     float4 steveSpacePos = mul(
         float4(ndc, kNdcDepth, 1), g_view.invViewProj);
@@ -105,7 +103,6 @@ float3 rayDirFromNDC(float2 ndc) {
     return normalize(steveSpacePos.xyz - g_view.viewOriginSteveSpace);
 }
 
-// Returns true both for upscaling (e.g. DLSS) and anti-aliasing (e.g. DLAA)
 bool isUpscalingEnabled() {
     return !g_view.enableTAA;
 }
@@ -153,7 +150,7 @@ float4 unpackObjectInstanceTintColor(uint packedColor) {
 }
 
 float2 unpackVertexUV(uint packedUV, bool packedUvIncludesBias = false) {
-    const float uvScale = 1.0 / 65535.0; // 1.0/0xffff
+    const float uvScale = 1.0 / 65535.0;
     const float biasScale = 1.0 / 32768.0;
 
     if (packedUvIncludesBias) {
@@ -164,16 +161,14 @@ float2 unpackVertexUV(uint packedUV, bool packedUvIncludesBias = false) {
     } else {
         float2 uv = float2(packedUV & 0xffff, packedUV >> 16) * uvScale;
 
-        // Quantize UVs according to largest possible texture size (32k on NVidia), fixes visible texture seams on certain objects.
         uv = round(uv * 32768) * (1.0 / 32768.0);
 
         return uv;
     }
 }
 
-// Determine whether g_view.directionToSun is actually direction to moon.
 bool isMoonPrimaryLight() {
-    if (abs(g_view.directionToSun.y) > 0.999) return g_view.skyTextureW > 0.9; // fix moon breaking at noon
+    if (abs(g_view.directionToSun.y) > 0.999) return g_view.skyTextureW > 0.9;
     float angle1 = g_view.sunAzimuth - PI;
     float angle2 = atan2(g_view.directionToSun.z, g_view.directionToSun.x);
     float angleDiff = abs(angle1-angle2);
@@ -202,6 +197,14 @@ float3 offsetCelestialDirection(float3 direction) {
 
 float3 getOffsetPrimaryCelestialDirection() {
     return offsetCelestialDirection(g_view.directionToSun);
+}
+
+float3 getOffsetTrueDirectionToSun() {
+    return offsetCelestialDirection(getTrueDirectionToSun());
+}
+
+float3 getOffsetTrueDirectionToMoon() {
+    return offsetCelestialDirection(getTrueDirectionToMoon());
 }
 
 float3 sampleCelestialLightDisk(float3 lightDirection, float2 sampleValue) {

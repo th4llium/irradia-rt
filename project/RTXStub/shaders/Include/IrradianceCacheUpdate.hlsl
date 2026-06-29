@@ -11,7 +11,7 @@
 #include "Shadows.hlsl"
 
 #ifndef IRRADIANCE_CACHE_POINT_LIGHT_COUNT
-#define IRRADIANCE_CACHE_POINT_LIGHT_COUNT 4
+#define IRRADIANCE_CACHE_POINT_LIGHT_COUNT PERF_CACHE_POINT_LIGHT_COUNT
 #endif
 
 #ifndef IRRADIANCE_CACHE_MIN_UPDATE_ALPHA
@@ -19,11 +19,11 @@
 #endif
 
 #ifndef IRRADIANCE_CACHE_RAYS_PER_HEMISPHERE
-#define IRRADIANCE_CACHE_RAYS_PER_HEMISPHERE 4
+#define IRRADIANCE_CACHE_RAYS_PER_HEMISPHERE PERF_CACHE_RAYS_PER_HEMISPHERE
 #endif
 
 #ifndef IRRADIANCE_CACHE_EMISSIVE_SCALE
-#define IRRADIANCE_CACHE_EMISSIVE_SCALE 0.8
+#define IRRADIANCE_CACHE_EMISSIVE_SCALE PERF_EMISSIVE_CACHE_SURFACE_SCALE
 #endif
 
 struct IrradianceCacheLightData
@@ -84,7 +84,6 @@ uint GetIrradianceCacheSeed(
     float3 worldNormal,
     uint frameSeed)
 {
-    // Coincident mesh vertices share a sequence.
     int3 quantizedPosition = int3(round(worldPosition * 256.0));
     int3 quantizedNormal = int3(round(worldNormal * 1024.0));
 
@@ -151,8 +150,8 @@ float3 GetCacheSkyRadiance(
     float3 rayOrigin,
     float3 rayDirection)
 {
-    float3 sunDirection = getOffsetPrimaryCelestialDirection();
-    float3 moonDirection = -sunDirection;
+    float3 sunDirection = getOffsetTrueDirectionToSun();
+    float3 moonDirection = getOffsetTrueDirectionToMoon();
     float3 atmosphereOrigin = rayOrigin;
     atmosphereOrigin.y = max(atmosphereOrigin.y, CAM_HEIGHT);
 
@@ -167,7 +166,7 @@ float3 GetCacheSkyRadiance(
         rayDirection,
         INFINITY,
         sunDirection,
-        sunRadiance,
+        sunRadiance * GetDaySkyAmount(sunDirection),
         transmittance);
     radiance *= transmittance.w;
 
@@ -184,7 +183,7 @@ float3 GetCacheSkyRadiance(
         rayDirection,
         INFINITY,
         moonDirection,
-        moonRadiance);
+        moonRadiance * GetMoonAmount(sunDirection, moonDirection));
 
     radiance *= GetAutoExposureMultiplier(
         rayOrigin, sunDirection, moonDirection);
@@ -195,14 +194,16 @@ float3 EvaluateCacheDirectIrradiance(
     float3 position,
     float3 normal)
 {
-    float3 sunDirection = getOffsetPrimaryCelestialDirection();
-    float3 moonDirection = -sunDirection;
-    float isSun = step(0.0, sunDirection.y);
+    float3 sunDirection = getOffsetTrueDirectionToSun();
+    float3 moonDirection = getOffsetTrueDirectionToMoon();
+    float sunFade = GetSunAmount(sunDirection);
+    float moonFade = GetMoonAmount(sunDirection, moonDirection);
+    float isSun = step(moonFade, sunFade);
     float3 mainLightDirection =
         lerp(moonDirection, sunDirection, isSun);
     float mainLightFade = lerp(
-        saturate(moonDirection.y),
-        saturate(sunDirection.y),
+        moonFade,
+        sunFade,
         isSun);
     float exposure = GetAutoExposureMultiplier(
         position, sunDirection, moonDirection);
@@ -273,13 +274,14 @@ float3 EvaluateCacheDirectIrradiance(
         shadowRay.Origin = position + normal * 1.0e-3;
         shadowRay.Direction = lightDirection;
         shadowRay.TMin = 0.0;
-        shadowRay.TMax = max(lightDistance - 0.55, 0.0);
+        shadowRay.TMax = GetEmissiveLightShadowTMax(lightDistance);
 
         ShadowPayload shadowPayload;
         TraceShadowRay(shadowRay, shadowPayload);
 
         float attenuation =
-            1.0 / max(lightDistance * lightDistance, 0.001);
+            GetEmissiveLightAttenuation(lightDistance)
+            * PERF_EMISSIVE_CACHE_LIGHT_SCALE;
         irradiance += shadowPayload.transmission
             * attenuation
             * lightData.intensity

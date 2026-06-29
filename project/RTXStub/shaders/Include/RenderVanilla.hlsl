@@ -19,13 +19,14 @@ float2 GetBlueNoise2D(inout RayState rayState) {
 float GetBlueNoise1D(inout RayState rayState) {
     uint3 noiseCoord = uint3(rayState.pixelCoord.xy % uint2(64, 32), g_view.frameCount % 8);
     float4 baseBlueNoise = blueNoiseTexture.Load(uint4(noiseCoord, 0));
-    float val = frac(baseBlueNoise.z + rayState.blueNoiseSequence * 0.61803398875);
+    float sampleValue =
+        frac(baseBlueNoise.z + rayState.blueNoiseSequence * 0.61803398875);
     rayState.blueNoiseSequence++;
-    return val;
+    return sampleValue;
 }
 
-static const int MAX_PATH_BOUNCES = 4;
-static const int RUSSIAN_ROULETTE_START_BOUNCE = 3;
+static const int MAX_PATH_BOUNCES = PERF_MAX_PATH_BOUNCES;
+static const int RUSSIAN_ROULETTE_START_BOUNCE = PERF_RUSSIAN_ROULETTE_START;
 
 float3 GetDielectricExtinction(float3 color, float opacity)
 {
@@ -54,6 +55,112 @@ float3 ClampIndirectRadiance(float3 radiance, float maxLuminance)
     return luminance > maxLuminance
         ? radiance * (maxLuminance / luminance)
         : radiance;
+}
+
+float3 EvaluateDielectricReflectionAmbient(
+    HitInfo hitInfo,
+    ObjectInstance objectInstance)
+{
+    GeometryInfo geometryInfo =
+        GetGeometryInfo(hitInfo, objectInstance);
+    SurfaceInfo surfaceInfo =
+        MaterialVanilla(hitInfo, geometryInfo, objectInstance);
+
+    if (surfaceInfo.shouldDiscard)
+        return (0.0).xxx;
+
+    float3 diffuseColor =
+        surfaceInfo.color * (1.0 - surfaceInfo.metalness);
+    float3 sunDir = getOffsetTrueDirectionToSun();
+    float3 moonDir = getOffsetTrueDirectionToMoon();
+    float3 skyAmbient;
+    float skyLux;
+    GetSkyAmbientAndLux(
+        surfaceInfo.position,
+        surfaceInfo.normal,
+        sunDir,
+        moonDir,
+        skyAmbient,
+        skyLux);
+
+    float skyFacing =
+        saturate(0.28 + 0.72 * max(surfaceInfo.normal.y, 0.0));
+    float3 ambientRadiance =
+        diffuseColor
+        * skyAmbient
+        * skyFacing
+        * PERF_DIELECTRIC_REFLECTION_AMBIENT_STRENGTH;
+
+    IrradianceCacheSample incoming =
+        SampleIncomingIrradianceCache(hitInfo, objectInstance);
+    ambientRadiance += diffuseColor
+        * incoming.irradiance
+        * (incoming.confidence
+            * PERF_DIELECTRIC_REFLECTION_CACHE_AMBIENT_STRENGTH / PI);
+
+    if (surfaceInfo.emissive > 0.0) {
+        ambientRadiance += surfaceInfo.color
+            * surfaceInfo.emissive
+            * PERF_EMISSIVE_CACHE_SURFACE_SCALE;
+    }
+
+    return ClampIndirectRadiance(ambientRadiance, 32.0);
+}
+
+float3 TraceDielectricReflectionProbe(
+    float3 position,
+    float3 normal,
+    float3 direction)
+{
+    RayDesc reflectionRay;
+    reflectionRay.Origin =
+        position
+        + normal * (dot(direction, normal) >= 0.0 ? 1.0e-3 : -1.0e-3);
+    reflectionRay.Direction = safeNormalize(direction, normal);
+    reflectionRay.TMin = 0.0;
+    reflectionRay.TMax = PERF_DIELECTRIC_REFLECTION_PROBE_DISTANCE;
+
+    RayQuery<RAY_FLAG_NONE> query;
+    query.TraceRayInline(
+        SceneBVH,
+        RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES,
+        INSTANCE_MASK_OPAQUE_OR_ALPHA_TEST_SECONDARY,
+        reflectionRay);
+
+    while (query.Proceed())
+    {
+        HitInfo candidate = GetCandidateHitInfo(query);
+        if (AlphaTestHitLogic(candidate))
+            query.CommitNonOpaqueTriangleHit();
+    }
+
+    if (query.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+    {
+        HitInfo reflectedHit = GetCommittedHitInfo(query);
+        ObjectInstance reflectedObject =
+            objectInstances[reflectedHit.objectInstanceIndex];
+        float cacheConfidence;
+        float3 cachedRadiance = SampleOutgoingRadianceCache(
+            reflectedHit, reflectedObject, cacheConfidence);
+        float3 directRadiance = EvaluateCachedOutgoingRadiance(
+            reflectedHit, reflectedObject, (0.0).xxx);
+        float3 ambientRadiance = EvaluateDielectricReflectionAmbient(
+            reflectedHit, reflectedObject);
+        float ambientBlend = saturate(
+            1.0 - getLuminance(directRadiance)
+                / max(getLuminance(ambientRadiance) * 2.0, 1.0e-4));
+        float3 uncachedRadiance =
+            directRadiance + ambientRadiance * ambientBlend;
+        return ClampIndirectRadiance(
+            lerp(
+                uncachedRadiance,
+                cachedRadiance,
+                cacheConfidence
+                    * PERF_DIELECTRIC_REFLECTION_CACHE_BLEND),
+            64.0);
+    }
+
+    return GetTransparentEnvironmentSky(direction);
 }
 
 float3 GetSurfaceMediumExtinction(
@@ -168,11 +275,11 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
     float roughness = max(originalRoughness, 0.035);
     float NdotV = max(dot(surfaceInfo.normal, V), 0.0001);
 
-    float3 sunDir = getOffsetPrimaryCelestialDirection();
-    float3 moonDir = -sunDir;
-    float isSun = step(0.0, sunDir.y);
-    float sunFade = saturate(sunDir.y);
-    float moonFade = saturate(moonDir.y);
+    float3 sunDir = getOffsetTrueDirectionToSun();
+    float3 moonDir = getOffsetTrueDirectionToMoon();
+    float sunFade = GetSunAmount(sunDir);
+    float moonFade = GetMoonAmount(sunDir, moonDir);
+    float isSun = step(moonFade, sunFade);
     float3 mainLightDir = lerp(moonDir, sunDir, isSun);
     float mainLightFade = lerp(moonFade, sunFade, isSun);
 
@@ -190,12 +297,15 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
             rayState.throughput *= surfaceInfo.color;
             rayState.rayDesc.TMin = hitInfo.rayT + 0.001;
         } else if (isWater || isGlass) {
-            bool isFirstVisibleGlass = !rayState.foundPrimarySurface;
-            uint dielectricPath = (
-                isFirstVisibleGlass && rayState.bounceCount == 0)
+            bool isPrimaryDielectricPath =
+                !rayState.foundPrimarySurface
+                && rayState.bounceCount == 0;
+            bool isFirstVisibleGlass =
+                isPrimaryDielectricPath
+                && !rayState.primaryDielectricSurfaceSeen;
+            uint dielectricPath = isPrimaryDielectricPath
                 ? rayState.dielectricPath
                 : kDielectricPathSample;
-            rayState.dielectricPath = kDielectricPathSample;
             float dielectricRoughness = isWater
                 ? WATER_INTERFACE_ROUGHNESS
                 : roughness;
@@ -205,6 +315,7 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
             {
                 float3 sunlight = 0;
                 float3 localSpecular = 0;
+                float3 skyAmbient = 0;
                 float NdotL_main = dot(surfaceInfo.normal, mainLightDir);
                 
                 if (dielectricPath != kDielectricPathRefract
@@ -240,7 +351,27 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
                 }
 
                 if (dielectricPath != kDielectricPathRefract) {
-                    int glassLightCount = min(25, g_view.cpuLightsCount);
+                    if (isWater) {
+                        float3 skyAmbientRadiance; float skyLux;
+                        GetSkyAmbientAndLux(
+                            surfaceInfo.position,
+                            surfaceInfo.normal,
+                            sunDir,
+                            moonDir,
+                            skyAmbientRadiance,
+                            skyLux);
+                        float waterFacing = saturate(0.35 + 0.65 * surfaceInfo.normal.y);
+                        float viewFresnel = F_Schlick(
+                            max(dot(surfaceInfo.normal, V), 0.0),
+                            dielectricF0Color).x;
+                        skyAmbient = skyAmbientRadiance
+                            * waterFacing
+                            * lerp(0.28, 0.55, viewFresnel);
+                    }
+
+                    int glassLightCount = min(
+                        PERF_GLASS_LOCAL_LIGHT_COUNT,
+                        (int)g_view.cpuLightsCount);
                     [loop]
                     for (int lightIndex = 0; lightIndex < glassLightCount; lightIndex++) {
                         LightInfo lightInfo = inputLightsBuffer[lightIndex];
@@ -279,12 +410,13 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
                         shadowRay.TMin = 0.0;
                         shadowRay.TMax = 10000.0;
 
-                        shadowRay.TMax = max(lightDistance - 0.55, 0.0);
+                        shadowRay.TMax =
+                            GetEmissiveLightShadowTMax(lightDistance);
                         ShadowPayload payload;
                         TraceShadowRay(shadowRay, payload);
 
-                        float attenuation = 1.0
-                            / max(lightDistance * lightDistance, 0.001);
+                        float attenuation =
+                            GetEmissiveLightAttenuation(lightDistance);
                         float3 lightContrib = payload.transmission * attenuation
                             * lightData.intensity * lightData.color
                             * NdotL * PI * 700.0;
@@ -294,12 +426,13 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
                 
                 float3 emission =
                     dielectricPath != kDielectricPathRefract
-                    ? sunlight + localSpecular
+                    ? sunlight + localSpecular + skyAmbient
                     : (0.0).xxx;
-                const float emissiveIntensity = 8.0;
                 if (dielectricPath != kDielectricPathReflect
                     && surfaceInfo.emissive > 0.0)
-                    emission += surfaceInfo.color * surfaceInfo.emissive * emissiveIntensity;
+                    emission += surfaceInfo.color
+                        * surfaceInfo.emissive
+                        * PERF_EMISSIVE_SURFACE_INTENSITY;
                 emission *= rayState.globalExposure;
                 rayState.color += emission * rayState.throughput;
                 if (!rayState.foundPrimarySurface) {
@@ -364,16 +497,31 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
                 isReflection = GetBlueNoise1D(rayState) < reflectionProbability;
             }
 
-            if (isFirstVisibleGlass)
+            if (isFirstVisibleGlass) {
                 rayState.hitGlassPrimary = !totalInternalReflection;
+                rayState.primaryDielectricSurfaceSeen = true;
+            }
 
-            if (dielectricPath != kDielectricPathSample) {
-                float transmissionScale =
-                    isWater ? 1.0 : eta * eta;
-                rayState.throughput *= isReflection
-                    ? F
-                    : (1.0 - F) * transmissionScale;
-            } else {
+            if (isFirstVisibleGlass
+                && dielectricPath == kDielectricPathRefract
+                && !totalInternalReflection)
+            {
+                float skyReflectionWeight =
+                    isWater
+                        ? max(F, PERF_WATER_MIN_REFLECTION_WEIGHT)
+                        : F;
+                float3 surfaceReflection =
+                    TraceDielectricReflectionProbe(
+                        surfaceInfo.position,
+                        surfaceInfo.normal,
+                        reflDir)
+                    * skyReflectionWeight
+                    * rayState.throughput;
+                rayState.primaryEmission += surfaceReflection;
+                rayState.color += surfaceReflection;
+            }
+
+            if (dielectricPath == kDielectricPathSample) {
                 float eventProbability = isReflection
                     ? reflectionProbability
                     : (1.0 - reflectionProbability);
@@ -383,6 +531,22 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
                     ? F
                     : (1.0 - F) * transmissionScale;
                 rayState.throughput *= eventResponse / max(eventProbability, 0.0001);
+
+                float missingF = isReflection ? (1.0 - F) : F;
+                if (missingF > 0.01) {
+                    float3 missingDir = isReflection ? refrDir : reflDir;
+                    float3 missingSkyRadiance =
+                        GetTransparentEnvironmentSky(missingDir);
+                    float3 missingContrib = missingSkyRadiance * missingF;
+                    rayState.color += missingContrib * rayState.throughput
+                        * (eventProbability / max(eventResponse, 0.0001));
+                }
+            } else {
+                float transmissionScale =
+                    isWater ? 1.0 : eta * eta;
+                rayState.throughput *= isReflection
+                    ? F
+                    : (1.0 - F) * transmissionScale;
             }
 
             if (!isReflection) {
@@ -399,7 +563,7 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
                 }
             }
 
-            if (isFirstVisibleGlass) {
+            if (isFirstVisibleGlass && isReflection) {
                 rayState.foundPrimarySurface = true;
                 rayState.primaryLobe = kPrimaryLobeSpecular;
                 rayState.primaryAlbedo = (1.0).xxx;
@@ -426,9 +590,11 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
             rayState.rayDesc.Direction = outgoingDirection;
             rayState.rayDesc.TMin = 0.0;
 
-            rayState.bounceCount++;
-            if (rayState.bounceCount >= MAX_PATH_BOUNCES)
-                rayState.terminate = true;
+            if (isReflection) {
+                rayState.bounceCount++;
+                if (rayState.bounceCount >= MAX_PATH_BOUNCES)
+                    rayState.terminate = true;
+            }
         } else {
             float3 skyAmbient; float skyLux;
             GetSkyAmbientAndLux(surfaceInfo.position, float3(0, 1, 0), sunDir, moonDir, skyAmbient, skyLux);
@@ -471,8 +637,10 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
             float3 light = ambient + sunlight;
             float3 emission = surfaceInfo.alpha * light;
             
-            const float emissiveIntensity = 15.0;
-            if (surfaceInfo.emissive > 0.0) emission += surfaceInfo.color * surfaceInfo.emissive * emissiveIntensity;
+            if (surfaceInfo.emissive > 0.0)
+                emission += surfaceInfo.color
+                    * surfaceInfo.emissive
+                    * PERF_TRANSLUCENT_EMISSIVE_SURFACE_INTENSITY;
                 
             float exposure = rayState.globalExposure;
             emission *= exposure;
@@ -534,6 +702,10 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
             ShadowPayload payload;
             TraceShadowRay(shadowRay, payload);
             shadowTransmission = payload.transmission;
+            shadowTransmission *= GetVolumetricCloudShadowTransmission(
+                shadowRay.Origin,
+                shadowDirection,
+                GetBlueNoise1D(rayState));
         }
 
         if (rayState.bounceCount == 0) {
@@ -583,7 +755,10 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
         outputBufferSunLightShadow[rayState.pixelCoord] = 0.0;
     }
     
-    int lightCount = min(25, g_view.cpuLightsCount);
+    int localLightCap = rayState.bounceCount == 0
+        ? PERF_PRIMARY_LOCAL_LIGHT_COUNT
+        : PERF_SECONDARY_LOCAL_LIGHT_COUNT;
+    int lightCount = min(localLightCap, (int)g_view.cpuLightsCount);
     [loop]
     for (int lightIndex = 0; lightIndex < lightCount; lightIndex++) {
         LightInfo lightInfo = inputLightsBuffer[lightIndex];
@@ -596,7 +771,7 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
         if (NdotL <= 0.0)
             continue;
 
-        float attenuation = 1.0 / max(lightDistance * lightDistance, 0.001);
+        float attenuation = GetEmissiveLightAttenuation(lightDistance);
         float3 H = safeNormalize(V + lightDirection, surfaceInfo.normal);
         float NdotH = max(dot(surfaceInfo.normal, H), 0.0);
         float LdotH = max(dot(lightDirection, H), 0.0);
@@ -624,7 +799,7 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
         shadowRay.Origin = surfaceInfo.position + 1.0e-3 * surfaceInfo.normal;
         shadowRay.Direction = lightDirection;
         shadowRay.TMin = 0.0;
-        shadowRay.TMax = max(lightDistance - 0.55, 0.0);
+        shadowRay.TMax = GetEmissiveLightShadowTMax(lightDistance);
 
         ShadowPayload payload;
         TraceShadowRay(shadowRay, payload);
@@ -640,9 +815,10 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
     if (objectInstance.flags & (kObjectInstanceFlagSun | kObjectInstanceFlagMoon)) {
         emission = surfaceInfo.color * ((objectInstance.flags & kObjectInstanceFlagSun ? g_view.sunMeshIntensity : g_view.moonMeshIntensity) * surfaceInfo.alpha);
     } else {
-        const float emissiveIntensity = 8.0;
         if (surfaceInfo.emissive > 0.0)
-            emission = surfaceInfo.color * surfaceInfo.emissive * emissiveIntensity;
+            emission = surfaceInfo.color
+                * surfaceInfo.emissive
+                * PERF_EMISSIVE_SURFACE_INTENSITY;
     }
     
     if (objectInstance.flags & kObjectInstanceFlagGlint)
@@ -673,12 +849,15 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
         rayState.primaryRoughness = max(originalRoughness, 0.02);
         rayState.primaryMetalness = surfaceInfo.metalness;
         rayState.primaryCachedIrradiance =
-            irradianceCacheSample.irradiance;
+            irradianceCacheSample.irradiance
+            * rayState.throughput;
         rayState.primaryIrradianceCacheConfidence =
             irradianceCacheBlend;
         rayState.diffuseIrradiance +=
             irradianceCacheSample.irradiance
-            * (irradianceCacheBlend / PI);
+            * rayState.throughput
+            * (irradianceCacheBlend
+                * PERF_IRRADIANCE_CACHE_PRIMARY_STRENGTH / PI);
         
         rayState.distance = rayState.accumulatedDistance + hitInfo.rayT;
         rayState.motion = surfaceInfo.position - surfaceInfo.prevPosition;
@@ -688,7 +867,8 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
         float3 cachedBounce = ClampIndirectRadiance(
             diffuseColor
                 * irradianceCacheSample.irradiance
-                * (irradianceCacheBlend / PI)
+                * (irradianceCacheBlend
+                    * PERF_IRRADIANCE_CACHE_BOUNCE_STRENGTH / PI)
                 * rayState.throughput,
             rayState.primaryLobe == kPrimaryLobeSpecular
                 ? 32.0
@@ -793,7 +973,9 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
         if (pdf > 0.00001)
             pathWeight = diffuseBRDF * NdotL / (pdf * max(diffuseProbability, 0.0001));
 
-        pathWeight *= 1.0 - irradianceCacheBlend;
+        pathWeight *=
+            1.0 - irradianceCacheBlend
+                * PERF_IRRADIANCE_CACHE_PATH_SUPPRESSION;
     }
 
     if (ContinueOpaquePath(

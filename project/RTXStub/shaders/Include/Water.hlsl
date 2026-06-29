@@ -48,7 +48,7 @@ float get_water_height(float2 p, float time)
 #endif
 
 #ifndef WATER_CAUSTICS_SCALE
-#define WATER_CAUSTICS_SCALE 0.65
+#define WATER_CAUSTICS_SCALE 0.90
 #endif
 
 #ifndef WATER_CAUSTICS_WARP

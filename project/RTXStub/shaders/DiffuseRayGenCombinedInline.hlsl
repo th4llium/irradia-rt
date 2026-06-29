@@ -10,11 +10,19 @@
 #endif
 
 #ifndef IRRADIANCE_CACHE_RECONSTRUCTION_STRENGTH
-#define IRRADIANCE_CACHE_RECONSTRUCTION_STRENGTH 0.9
+#define IRRADIANCE_CACHE_RECONSTRUCTION_STRENGTH PERF_IRRADIANCE_CACHE_RECONSTRUCTION_STRENGTH
+#endif
+
+#ifndef IRRADIANCE_CACHE_FALLBACK_STRENGTH
+#define IRRADIANCE_CACHE_FALLBACK_STRENGTH PERF_IRRADIANCE_CACHE_FALLBACK_STRENGTH
+#endif
+
+#ifndef IRRADIANCE_CACHE_PRIMARY_STRENGTH
+#define IRRADIANCE_CACHE_PRIMARY_STRENGTH PERF_IRRADIANCE_CACHE_PRIMARY_STRENGTH
 #endif
 
 #ifndef HIGH_RES_GI_RAY_COUNT
-#define HIGH_RES_GI_RAY_COUNT 2
+#define HIGH_RES_GI_RAY_COUNT PERF_HIGH_RES_GI_RAY_COUNT
 #endif
 
 #ifndef HIGH_RES_GI_RAY_DISTANCE
@@ -25,8 +33,12 @@
 #define HIGH_RES_GI_STRENGTH 1.0
 #endif
 
+#ifndef HIGH_RES_GI_MIN_BLEND
+#define HIGH_RES_GI_MIN_BLEND PERF_HIGH_RES_GI_MIN_BLEND
+#endif
+
 #ifndef HIGH_RES_GI_MULTIBOUNCE_STRENGTH
-#define HIGH_RES_GI_MULTIBOUNCE_STRENGTH 0.35
+#define HIGH_RES_GI_MULTIBOUNCE_STRENGTH PERF_HIGH_RES_GI_CACHE_BOUNCE_STRENGTH
 #endif
 
 float3 GetPrimaryWorldPosition(
@@ -88,12 +100,26 @@ float3 TraceDetailedCacheRadiance(RayDesc ray)
         ray.Origin, ray.Direction);
 }
 
+bool ShouldTraceHighResolutionGI(uint2 pixelPosition)
+{
+#if HIGH_RES_GI_RAY_COUNT <= 0
+    return false;
+#elif PERF_HIGH_RES_GI_CHECKERBOARD
+    return (((pixelPosition.x + pixelPosition.y + g_view.frameCount) & 1) != 0);
+#else
+    return true;
+#endif
+}
+
 float3 TraceHighResolutionGI(
     uint2 pixelPosition,
     float3 position,
     float3 normal,
     float depth)
 {
+#if HIGH_RES_GI_RAY_COUNT <= 0
+    return (0.0).xxx;
+#else
     uint3 noiseCoord = uint3(
         pixelPosition % uint2(256, 256),
         g_view.frameCount % 128);
@@ -123,6 +149,7 @@ float3 TraceHighResolutionGI(
     radiance /= (float)HIGH_RES_GI_RAY_COUNT;
     return ClampCachedIrradiance(radiance)
         * ApproximatePrimaryTransmittance(depth);
+#endif
 }
 
 [numthreads(4, 8, 1)]
@@ -245,20 +272,33 @@ void DiffuseRayGenCombinedInline(
         centerSignal,
         filteredSignal,
         IRRADIANCE_CACHE_RECONSTRUCTION_STRENGTH)
-        * (1.0 / PI);
-    float3 detailRadiance = TraceHighResolutionGI(
-        pixelPosition,
-        centerPosition,
-        centerNormal,
-        centerDepth);
-    float detailWeight = HIGH_RES_GI_STRENGTH
-        * smoothstep(0.0, 0.75, centerCache.a);
+        * (IRRADIANCE_CACHE_FALLBACK_STRENGTH / PI);
+    float3 primaryCacheRadiance =
+        centerSignal * (IRRADIANCE_CACHE_PRIMARY_STRENGTH / PI);
+    float3 detailRadiance = coarseRadiance;
+    float detailWeight = 0.0;
+    if (ShouldTraceHighResolutionGI(pixelPosition))
+    {
+        detailRadiance = TraceHighResolutionGI(
+            pixelPosition,
+            centerPosition,
+            centerNormal,
+            centerDepth);
+        float confidenceWeight =
+            smoothstep(0.0, 0.35, centerCache.a);
+        detailWeight = saturate(
+            HIGH_RES_GI_STRENGTH
+            * lerp(
+                HIGH_RES_GI_MIN_BLEND,
+                1.0,
+                confidenceWeight));
+    }
     float3 resolvedRadiance = lerp(
         coarseRadiance,
         detailRadiance,
         detailWeight);
     float3 cacheCorrection =
-        resolvedRadiance - centerSignal * (1.0 / PI);
+        resolvedRadiance - primaryCacheRadiance;
 
     float4 diffuse =
         outputBufferIndirectDiffuse[pixelPosition];

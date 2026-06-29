@@ -81,7 +81,7 @@ struct RayState
     bool foundPrimarySurface;
     float accumulatedDistance;
 
-    uint instanceMask; // 8 bits, see INSTANCE_MASK macros in Constants.hlsl
+    uint instanceMask;
 
     uint randSeed;
     int bounceCount;
@@ -99,6 +99,7 @@ struct RayState
     float globalExposure;
     uint dielectricPath;
     bool hitGlassPrimary;
+    bool primaryDielectricSurfaceSeen;
 
     void Init(uint seed)
     {
@@ -144,6 +145,7 @@ struct RayState
         blueNoiseSequence = 0;
         dielectricPath = kDielectricPathSample;
         hitGlassPrimary = false;
+        primaryDielectricSurfaceSeen = false;
     }
 };
 
@@ -246,9 +248,9 @@ void ExitMedium(inout RayState rayState, uint mediumType)
 #include "Shadows.hlsl"
 #include "VolumetricLighting.hlsl"
 #include "Water.hlsl"
+#include "IrradianceCacheUpdate.hlsl"
 #include "RenderVanilla.hlsl"
 
-// RenderRay that outputs separated signals for denoising
 void RenderRayDenoised(
     uint2 pixelCoord,
     RayDesc rayDesc,
@@ -270,11 +272,13 @@ void RenderRayDenoised(
     rayState.Init(randSeed);
     rayState.dielectricPath = dielectricPath;
     float3 exposureSunDirection =
-        getOffsetPrimaryCelestialDirection();
+        getOffsetTrueDirectionToSun();
+    float3 exposureMoonDirection =
+        getOffsetTrueDirectionToMoon();
     rayState.globalExposure = GetAutoExposureMultiplier(
         rayDesc.Origin,
         exposureSunDirection,
-        -exposureSunDirection);
+        exposureMoonDirection);
     rayState.pixelCoord = pixelCoord;
     rayState.rayDesc = rayDesc;
 
@@ -303,11 +307,11 @@ void RenderRayDenoised(
             float3 mediumExtinction = GetCurrentMediumExtinction(rayState);
             rayState.throughput *= exp(-mediumExtinction * dist);
             if (rayState.inWater) {
-                float3 sunDir = getOffsetPrimaryCelestialDirection();
-                float3 moonDir = -sunDir;
-                float isSun = step(0.0, sunDir.y);
-                float sunFade = saturate(sunDir.y);
-                float moonFade = saturate(moonDir.y);
+                float3 sunDir = getOffsetTrueDirectionToSun();
+                float3 moonDir = getOffsetTrueDirectionToMoon();
+                float sunFade = GetSunAmount(sunDir);
+                float moonFade = GetMoonAmount(sunDir, moonDir);
+                float isSun = step(moonFade, sunFade);
                 float3 mainLightDir = lerp(moonDir, sunDir, isSun);
                 float cosTheta = dot(rayState.rayDesc.Direction, mainLightDir);
                 float g = 0.6;
@@ -335,11 +339,19 @@ void RenderRayDenoised(
         }
         else
         {
-            // Sky hit
             if (outFirstHitDistance < 0.0) outFirstHitDistance = 65504.0;
             float3 colorBefore = rayState.color;
             RenderSky(rayState);
             float3 skyContribution = rayState.color - colorBefore;
+            if ((rayState.hitGlassPrimary || rayState.inWater)
+                && getLuminance(skyContribution) < 1.0e-5)
+            {
+                skyContribution =
+                    rayState.throughput
+                    * GetTransparentEnvironmentSky(
+                        rayState.rayDesc.Direction);
+                rayState.color = colorBefore + skyContribution;
+            }
             
             if (!rayState.foundPrimarySurface) {
                 rayState.primaryEmission += skyContribution;
@@ -368,7 +380,7 @@ void RenderRayDenoised(
         }
     }
 
-    outputDistance = min(rayState.accumulatedDistance, 65504.0);
+    outputDistance = min(rayState.distance, 65504.0);
     outputMotion = rayState.motion;
 
     outDiffuseIrradiance = rayState.diffuseIrradiance;

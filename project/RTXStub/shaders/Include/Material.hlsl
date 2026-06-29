@@ -34,7 +34,7 @@ struct HitInfo
     float rayT;
     bool frontFacing;
     float2 barycentric2;
-    uint materialType; // See MATERIAL_TYPE macros in Constants.hlsl
+    uint materialType;
     uint objectInstanceIndex;
     uint primitiveId;
 };
@@ -70,21 +70,16 @@ struct GeometryInfo
     float3 barycentric;
     float uvAreaPerWorldArea;
 
-    // TBN
     float3 tangent;
     float3 bitangent;
     float3 geometryNormal;
 
-    // Vertex attributes
     float3 position;
-    float3 vertexNormal; // May be invalid for certain objects, check if normalByteOffset is not 0
+    float3 vertexNormal;
     float4 color;
     float2 uv0;
-    // float2 uv1;
-    // float2 uv2;
-    // float2 uv3;
-    uint pbrTextureDataIndex; // Optional, equals to kInvalidPBRTextureHandle if inapplicable.
-    float3 previousPosition; // Optional, equals to 0 by default. Check for kObjectInstanceFlagHasMotionVectors flag to see if it's applicable.
+    uint pbrTextureDataIndex;
+    float3 previousPosition;
 };
 
 GeometryInfo GetGeometryInfo(HitInfo hitInfo, ObjectInstance objectInstance) {
@@ -97,14 +92,16 @@ GeometryInfo GetGeometryInfo(HitInfo hitInfo, ObjectInstance objectInstance) {
     uint uv1ByteOffset = objectInstance.offsetPack3 & 0xff;
     uint uv2ByteOffset = objectInstance.offsetPack3 >> 8;
     uint uv3ByteOffset = objectInstance.offsetPack4 & 0xff;
-    uint PBRTextureIdByteOffset = objectInstance.offsetPack4 >> 8;
+    uint pbrTextureIdByteOffset = objectInstance.offsetPack4 >> 8;
     uint previousPositionOffset = objectInstance.offsetPack5 & 0xff;
-    uint mediaType = objectInstance.offsetPack5 >> 8; // See MEDIA_TYPE macros in Constants.hlsl
 
     ByteAddressBuffer vertexBuffer = vertexBuffers[objectInstance.vbIdx];
 
     uint firstVertexOffsetInQuad = (hitInfo.primitiveId / 2) * 4;
-    uint3 vertices = firstVertexOffsetInQuad + (hitInfo.primitiveId & 1 ? uint3(2, 3, 0) : uint3(0, 1, 2)); // Choose 3 vertices based on whether this is the first or second triangle in the quad.
+    uint3 vertices = firstVertexOffsetInQuad
+        + (hitInfo.primitiveId & 1
+            ? uint3(2, 3, 0)
+            : uint3(0, 1, 2));
     geometryInfo.barycentric = float3(1 - hitInfo.barycentric2.x - hitInfo.barycentric2.y, hitInfo.barycentric2.xy);
 
     float2 uvs[3];
@@ -119,7 +116,6 @@ GeometryInfo GetGeometryInfo(HitInfo hitInfo, ObjectInstance objectInstance) {
     [unroll]
     for (uint i = 0; i < 3; ++i)
     {
-        // Parallel buffers use vertexOffsetInParallelVertices.
         uint address = (vertices[i] + objectInstance.vertexOffsetInBaseVertices) * objectInstance.vertexStride;
    
         positions[i] = vertexBuffer.Load<float16_t4>(address + positionByteOffset).xyz;
@@ -136,17 +132,9 @@ GeometryInfo GetGeometryInfo(HitInfo hitInfo, ObjectInstance objectInstance) {
         geometryInfo.uv0 += geometryInfo.barycentric[i] * uvs[i];
     }
 
-    // Catch cases where vertex color is not provided (block breaking overlay).
     if (!colorByteOffset) geometryInfo.color = 1;
 
     geometryInfo.geometryNormal = safeNormalize(cross((positions[1] - positions[0]), (positions[2] - positions[0])), float3(0, 1, 0));
-    // vertexNormal = normalize(vertexNormal); // Vertex normal is not normalized as GeometryInfo is meant to pass raw attribute values.
-
-    // Solve the tangent frame from position and UV gradients:
-
-    // |T.x, B.x|                                |v1.x-v0.x, v2.x-v0.x|
-    // |T.y, B.y| * |uv1.x-uv0.x, uv2.x-uv0.x| = |v1.y-v0.y, v2.y-v0.y|
-    // |T.z, B.z|   |uv1.y-uv0.y, uv2.y-uv0.y|   |v1.z-v0.z, v2.z-v0.z|
 
     float2 dUV1 = uvs[1] - uvs[0];
     float2 dUV2 = uvs[2] - uvs[0];
@@ -161,7 +149,6 @@ GeometryInfo GetGeometryInfo(HitInfo hitInfo, ObjectInstance objectInstance) {
 
     if (det == 0.0)
     {
-        // Degenerate UVs need an arbitrary tangent frame.
         float3 helperVec = abs(dot(float3(0, 1, 0), geometryInfo.geometryNormal)) > 0.99 ? float3(1, 0, 0) : float3(0, 1, 0);
 
         geometryInfo.tangent = cross(geometryInfo.geometryNormal, helperVec);
@@ -180,8 +167,8 @@ GeometryInfo GetGeometryInfo(HitInfo hitInfo, ObjectInstance objectInstance) {
     geometryInfo.tangent = safeNormalize(geometryInfo.tangent, float3(1, 0, 0));
     geometryInfo.bitangent = safeNormalize(geometryInfo.bitangent, cross(geometryInfo.geometryNormal, geometryInfo.tangent));
 
-    geometryInfo.pbrTextureDataIndex = PBRTextureIdByteOffset ? 
-        vertexBuffer.Load<uint>((vertices[0] + objectInstance.vertexOffsetInBaseVertices) * objectInstance.vertexStride + PBRTextureIdByteOffset)
+    geometryInfo.pbrTextureDataIndex = pbrTextureIdByteOffset ?
+        vertexBuffer.Load<uint>((vertices[0] + objectInstance.vertexOffsetInBaseVertices) * objectInstance.vertexStride + pbrTextureIdByteOffset)
          : kInvalidPBRTextureHandle;
 
     return geometryInfo;
@@ -221,9 +208,7 @@ struct SurfaceInfo
     }
 };
 
-// Shared actor material evaluation.
 void EvaluateActorMaterial(ObjectInstance objectInstance, HitInfo hitInfo, float2 uv, float4 tintColor0, float4 tintColor1, inout float4 color, inout bool shouldDiscard) {
-    // List of materials, in priority order
     const uint kMaterialActorGlint        = (1 << 0);
     const uint kMaterialActorMultiTexture = (1 << 1);
     const uint kMaterialActorTint         = (1 << 2);
@@ -235,7 +220,6 @@ void EvaluateActorMaterial(ObjectInstance objectInstance, HitInfo hitInfo, float
     } else if (objectInstance.flags & kObjectInstanceFlagMultiTexture) {
         actorMaterial = kMaterialActorMultiTexture;
     } else if ((objectInstance.flags & kObjectInstanceFlagMultiplicativeTint) && !(objectInstance.flags & kObjectInstanceFlagUsesOverlayColor)) {
-        // Overlay color takes precedence over multiplicative tint.
         actorMaterial = kMaterialActorTint;
     } else {
         actorMaterial = kMaterialActor;
@@ -246,7 +230,6 @@ void EvaluateActorMaterial(ObjectInstance objectInstance, HitInfo hitInfo, float
     {
         tex1 = textures[objectInstance.secondaryTextureIdx].SampleLevel(pointSampler, uv, 0);
 
-        // MASKED_MULTITEXTURE
         if (objectInstance.flags & kObjectInstanceFlagMaskedMultiTexture)
         {
             bool maskedTexture = (tex1.r + tex1.g + tex1.b) * (1.0 - tex1.a) > 0.0;
@@ -254,10 +237,8 @@ void EvaluateActorMaterial(ObjectInstance objectInstance, HitInfo hitInfo, float
         }
     }
 
-    // applyChangeColor()
     if (hitInfo.materialType != MATERIAL_TYPE_ALPHA_TEST || (actorMaterial & (kMaterialActorMultiTexture | kMaterialActorTint)))
     {
-        // CHANGE_COLOR__MULTI is not used by vanilla actor materials.
         color.rgb *= lerp(1..xxx, tintColor0.rgb, color.a);
         color.a *= tintColor0.a;
     }
@@ -265,17 +246,14 @@ void EvaluateActorMaterial(ObjectInstance objectInstance, HitInfo hitInfo, float
     float alpha = color.a;
     if (objectInstance.secondaryTextureIdx != 0xffff)
     {
-        // applySecondColorTint()
         if ((actorMaterial & kMaterialActorTint) && hitInfo.materialType != MATERIAL_TYPE_ALPHA_BLEND)
         {
             alpha = tex1.a;
             color.rgb = lerp(color.rgb, tintColor1.rgb * tex1.rgb, tex1.a);
         }
 
-        // MULTI_TEXTURE
         if (objectInstance.tertiaryTextureIdx != 0xffff && (actorMaterial & kMaterialActorMultiTexture))
         {
-            // applyMultitextureAlbedo()
             float4 tex2 = textures[objectInstance.tertiaryTextureIdx].SampleLevel(pointSampler, uv, 0);
 
             alpha = tex1.a;
@@ -285,7 +263,6 @@ void EvaluateActorMaterial(ObjectInstance objectInstance, HitInfo hitInfo, float
         }
     }
 
-    // ALPHA_TEST
     const float actorAlphaEpsilon = 1e-5;
     if (hitInfo.materialType == MATERIAL_TYPE_ALPHA_TEST)
     {
@@ -303,10 +280,8 @@ void EvaluateActorMaterial(ObjectInstance objectInstance, HitInfo hitInfo, float
             shouldDiscard = alpha < actorAlphaEpsilon;
         }
 
-        // applyChangeColor()
         if (actorMaterial & (kMaterialActorGlint | kMaterialActor))
         {
-            // CHANGE_COLOR__MULTI is not used by vanilla actor materials.
             color.rgb *= lerp(1..xxx, tintColor0.rgb, color.a);
             color.a *= tintColor0.a;
         }
@@ -331,7 +306,6 @@ float CalculateRayConeTextureLod(
     float texelsPerWorldUnit = sqrt(
         max(geometryInfo.uvAreaPerWorldArea * (float)textureWidth * (float)textureHeight, 1.0e-8));
 
-    // Clamp the projected footprint at grazing angles.
     float projectionCosine = max(abs(dot(rayDirection, worldGeometryNormal)), 0.1);
     float footprintInTexels = (2.0 * rayConeRadius * texelsPerWorldUnit) / projectionCosine;
     float lod = log2(max(footprintInTexels, 1.0)) + g_view.mipmapBias;
@@ -378,7 +352,6 @@ SurfaceInfo MaterialVanilla(
 
     if (objectInstance.colourTextureIdx != 0xffff)
     {
-        // Banner UV fix
         if (isBanner)
         {
             float2 size;
@@ -388,7 +361,6 @@ SurfaceInfo MaterialVanilla(
         color = colorTex.SampleLevel(pointSampler, uv, textureLod);
     }
     
-    // Terrain uses the half-alpha threshold without setting the actor flag.
     surfaceInfo.shouldDiscard = hitInfo.materialType == MATERIAL_TYPE_ALPHA_TEST 
         && (objectInstance.flags & (kObjectInstanceFlagAlphaTestThresholdHalf | kObjectInstanceFlagChunk) ? color.a < 0.5 : color.a == 0.0);
 
@@ -398,22 +370,18 @@ SurfaceInfo MaterialVanilla(
 
         vertColor.rgb = lerp(1..xxx, seasonsTexture.SampleLevel(pointSampler, vertColor.xy, 0).rgb * 2.0, vertColor.z);
         vertColor.rgb *= vertColor.a;
-        color.a = 1.0; // In vanilla RenderChunk this only applies to opaque and alpha test passes
+        color.a = 1.0;
     }
     else
     {
-        // Some held items (bow, crossbow) have identical texture and vertex colors.
-        // Reset vertex color if that's the case, to avoid accidentally squaring albedo.
         if (all(abs(color - vertColor) < 0.001)) vertColor = 1;
     }
 
     if (isBanner)
     {
-        // Banner vertices may arrive with zero color.
         vertColor.rgb = lerp(vertColor.rgb, 1.xxx, color.a);
     }
 
-    // Remove baked directional shading from terrain vertex color.
     bool isTintShadedSurface = objectInstance.flags & (kObjectInstanceFlagChunk | kObjectInstanceFlagClouds) 
         && !(objectInstance.flags & kObjectInstanceFlagHasSeasonsTexture) 
         && vertColor.r == vertColor.g 
@@ -425,9 +393,7 @@ SurfaceInfo MaterialVanilla(
     color.rgb *= vertColor.rgb;
     if (objectInstance.flags & kObjectInstanceFlagChunk) color.a *= vertColor.a;
 
-    // ChangeColor
     float4 tintColor0 = unpackObjectInstanceTintColor(objectInstance.tintColour0);
-    // OverlayColor or MultiplicativeTintColor
     float4 tintColor1 = unpackObjectInstanceTintColor(objectInstance.tintColour1);
 
     const bool isActor = (
@@ -453,14 +419,11 @@ SurfaceInfo MaterialVanilla(
         EvaluateActorMaterial(objectInstance, hitInfo, uv, tintColor0, tintColor1, color, surfaceInfo.shouldDiscard);
     }
 
-    // applyActorDiffuse()
-    // applyOverlayColor()
     if (objectInstance.flags & kObjectInstanceFlagUsesOverlayColor)
     {
         color.rgb = lerp(color.rgb, tintColor1.rgb, tintColor1.a);
     }
 
-    // Gather PBR data
     if (geometryInfo.pbrTextureDataIndex != kInvalidPBRTextureHandle)
     {
         PBRTextureData pbr = pbrTextureDataBuffer[geometryInfo.pbrTextureDataIndex];
@@ -497,54 +460,49 @@ SurfaceInfo MaterialVanilla(
             }
             else if (pbr.flags & kPBRTextureDataFlagHasPackedHeightNormalsTexture)
             {
-                // This code is based on the Vibrant Visuals implementation of heightmaps, with packed egde normals.
-
-                // g_view.heightMapPixelEdgeWidth = 1/12
-                // g_view.recipHeightMapDepth = 1/4
                 const float kHeightMapFlattenEpsilon = 0.005;
 
-                float4 pixelEgdeNormals = colorTex.SampleLevel(pointSampler, normalUV, 0);
+                float4 pixelEdgeNormals = colorTex.SampleLevel(pointSampler, normalUV, 0);
                 float2 widthHeight;
                 colorTex.GetDimensions(widthHeight.x, widthHeight.y);
                 float2 nudgeSampleCoord = frac(normalUV * widthHeight);
-                pixelEgdeNormals = 2.0 * pixelEgdeNormals - 1.0;
-                texNormal.xy = pixelEgdeNormals.yz * step(1.0 - g_view.heightMapPixelEdgeWidth, nudgeSampleCoord) - pixelEgdeNormals.wx * step(nudgeSampleCoord, g_view.heightMapPixelEdgeWidth);
+                pixelEdgeNormals = 2.0 * pixelEdgeNormals - 1.0;
+                texNormal.xy =
+                    pixelEdgeNormals.yz
+                        * step(1.0 - g_view.heightMapPixelEdgeWidth, nudgeSampleCoord)
+                    - pixelEdgeNormals.wx
+                        * step(nudgeSampleCoord, g_view.heightMapPixelEdgeWidth);
                 texNormal.xy *= step(kHeightMapFlattenEpsilon, abs(texNormal.xy));
                 texNormal.z = g_view.recipHeightMapDepth;
                 texNormal = safeNormalize(texNormal, float3(0, 0, 1));
             }
             else
             {
-                // This code is based on the Vibrant Visuals implementation of traditional grayscale heightmaps.
-                
                 float2 widthHeight;
                 colorTex.GetDimensions(widthHeight.x, widthHeight.y);
                 float2 pixelCoord = normalUV * widthHeight;
                 {
-                    const float kNudgePixelCentreDistEpsilon = 0.0625;
+                    const float kNudgePixelCenterThreshold = 0.0625;
                     const float kNudgeUvEpsilon = 0.25 / 65536.;
                     float2 nudgeSampleCoord = frac(pixelCoord);
-                    if (abs(nudgeSampleCoord.x - 0.5) < kNudgePixelCentreDistEpsilon)
+                    if (abs(nudgeSampleCoord.x - 0.5) < kNudgePixelCenterThreshold)
                     {
                         normalUV.x += (nudgeSampleCoord.x > 0.5f) ? kNudgeUvEpsilon : -kNudgeUvEpsilon;
                     }
-                    if (abs(nudgeSampleCoord.y - 0.5) < kNudgePixelCentreDistEpsilon)
+                    if (abs(nudgeSampleCoord.y - 0.5) < kNudgePixelCenterThreshold)
                     {
                         normalUV.y += (nudgeSampleCoord.y > 0.5f) ? kNudgeUvEpsilon : -kNudgeUvEpsilon;
                     }
                 }
                 float4 heightSamples = colorTex.Gather(pointSampler, normalUV, 0);
                 float2 subPixelCoord = frac(pixelCoord + 0.5);
-                const float kBevelMode = 0.0;
                 float2 axisSamplePair = (subPixelCoord.y > 0.5) ? heightSamples.xy : heightSamples.wz;
-                float axisBevelCentreSampleCoord = subPixelCoord.x;
-                axisBevelCentreSampleCoord += ((axisSamplePair.x > axisSamplePair.y) ? g_view.heightMapPixelEdgeWidth : -g_view.heightMapPixelEdgeWidth) * kBevelMode;
-                int2 axisSampleIndices = int2(clamp(float2(axisBevelCentreSampleCoord - g_view.heightMapPixelEdgeWidth, axisBevelCentreSampleCoord + g_view.heightMapPixelEdgeWidth) * 2.f, 0.0, 1.0));
+                float axisCenterCoord = subPixelCoord.x;
+                int2 axisSampleIndices = int2(clamp(float2(axisCenterCoord - g_view.heightMapPixelEdgeWidth, axisCenterCoord + g_view.heightMapPixelEdgeWidth) * 2.f, 0.0, 1.0));
                 texNormal.x = (axisSamplePair[axisSampleIndices.x] - axisSamplePair[axisSampleIndices.y]);
                 axisSamplePair = (subPixelCoord.x > 0.5f) ? heightSamples.zy : heightSamples.wx;
-                axisBevelCentreSampleCoord = subPixelCoord.y;
-                axisBevelCentreSampleCoord += ((axisSamplePair.x > axisSamplePair.y) ? g_view.heightMapPixelEdgeWidth : -g_view.heightMapPixelEdgeWidth) * kBevelMode;
-                axisSampleIndices = int2(clamp(float2(axisBevelCentreSampleCoord - g_view.heightMapPixelEdgeWidth, axisBevelCentreSampleCoord + g_view.heightMapPixelEdgeWidth) * 2.f, 0.0, 1.0));
+                axisCenterCoord = subPixelCoord.y;
+                axisSampleIndices = int2(clamp(float2(axisCenterCoord - g_view.heightMapPixelEdgeWidth, axisCenterCoord + g_view.heightMapPixelEdgeWidth) * 2.f, 0.0, 1.0));
                 texNormal.y = (axisSamplePair[axisSampleIndices.x] - axisSamplePair[axisSampleIndices.y]);
                 texNormal.z = g_view.recipHeightMapDepth;
                 texNormal = safeNormalize(texNormal, float3(0, 0, 1));
@@ -553,7 +511,6 @@ SurfaceInfo MaterialVanilla(
         }
     }
 
-    // Invert back facing normals.
     if (!hitInfo.frontFacing) surfaceInfo.normal = -surfaceInfo.normal;
 
     surfaceInfo.color = color.rgb;

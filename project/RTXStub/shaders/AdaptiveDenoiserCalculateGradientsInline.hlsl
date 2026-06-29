@@ -8,5 +8,5 @@ void AdaptiveDenoiserCalculateGradientsInline(
     uint3 groupID : SV_GroupID
     )
 {
-    uint denoisingBufferIndex = g_rootConstant0 & 0xff; // use when selecting buffer from denoisingOutputs[] or denoisingInputs[] array
+    uint denoisingBufferIndex = g_rootConstant0 & 0xff;
 }

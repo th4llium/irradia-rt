@@ -6,5 +6,4 @@ void TAA(
     uint3 groupID : SV_GroupID
     )
 {
-    // g_rootConstant0 is inherited from FinalCombine.
 }

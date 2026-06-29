@@ -53,7 +53,6 @@ SAMPLER2D_AUTOREG(s_gRasterizedInput);
 SAMPLER2D_AUTOREG(s_gToneCurve);
 
 // FXAA from XorDev, source: https://github.com/XorDev/GM_FXAA
-// AgX Minimal from bwsrench, source: https://www.shadertoy.com/view/cd3XWr
 
 vec4 fromLinear(vec4 linearRGB) {
     bvec4 cutoff = lessThan(linearRGB, vec4(0.0031308, 0.0031308, 0.0031308, 0.0031308));
@@ -62,53 +61,58 @@ vec4 fromLinear(vec4 linearRGB) {
     return mix(higher, lower, cutoff);
 }
 
-vec3 agxDefaultContrastApprox(vec3 x) {
-    vec3 x2 = x * x;
-    vec3 x4 = x2 * x2;
-    return + 15.5     * x4 * x2
-           - 40.14    * x4 * x
-           + 31.96    * x4
-           - 6.868    * x2 * x
-           + 0.4298   * x2
-           + 0.1191   * x
-           - 0.00232;
+float Tonemap_Uchimura(float x, float P, float a, float m, float l, float c, float b) {
+    float l0 = ((P - m) * l) / a;
+    float L0 = m - m / a;
+    float L1 = m + (1.0 - m) / a;
+    float S0 = m + l0;
+    float S1 = m + a * l0;
+    float C2 = (a * P) / (P - S1);
+    float CP = -C2 / P;
+
+    float w0 = 1.0 - smoothstep(0.0, m, x);
+    float w2 = step(m + l0, x);
+    float w1 = 1.0 - w0 - w2;
+
+    float T = m * pow(max(x / m, 0.0), c) + b;
+    float S = P - (P - S1) * exp(CP * (x - S0));
+    float L = m + a * (x - m);
+
+    return T * w0 + L * w1 + S * w2;
 }
 
-vec3 agx(vec3 val) {
-    const mat3 agx_mat = mat3(
-        0.842479062253094, 0.0423282422610123, 0.0423756549057051,
-        0.0784335999999992,  0.878468636469772,  0.0784336,
-        0.0792237451477643, 0.0791661274605434, 0.879142973793104);
-    
-    const float min_ev = -12.47393;
-    const float max_ev = 4.026069;
-
-    val = mul(agx_mat, val);
-    val = clamp(log2(max(val, 1e-10)), min_ev, max_ev);
-    val = (val - min_ev) / (max_ev - min_ev);
-    val = agxDefaultContrastApprox(val);
-    return val;
+float Tonemap_Uchimura(float x) {
+    const float P = 1.0;
+    const float a = 1.0;
+    const float m = 0.22;
+    const float l = 0.4;
+    const float c = 1.33;
+    const float b = 0.0;
+    return Tonemap_Uchimura(x, P, a, m, l, c, b);
 }
 
-vec3 agxEotf(vec3 val) {
-    const mat3 agx_mat_inv = mat3(
-        1.19687900512017, -0.0528968517574562, -0.0529716355144438,
-        -0.0980208811401368, 1.15190312990417, -0.0980434501171241,
-        -0.0990297440797205, -0.0989611768448433, 1.15107367264116);
-    val = mul(agx_mat_inv, val);
-    return val;
+vec3 Tonemap_Uchimura(vec3 x) {
+    return max(
+        vec3(
+            Tonemap_Uchimura(x.r),
+            Tonemap_Uchimura(x.g),
+            Tonemap_Uchimura(x.b)),
+        0.0);
 }
 
-vec3 agxLook(vec3 val) {  
-    vec3 offset = vec3(0.0, 0.0, 0.0);
-    vec3 slope = vec3(1.0, 1.0, 1.0);
-    vec3 power = vec3(1.35, 1.35, 1.35);
-    float sat = 1.4;
-    
-    val = pow(max(val * slope + offset, 0.0), power);
+vec3 applyColorGrade(vec3 color) {
     const vec3 lw = vec3(0.2126, 0.7152, 0.0722);
-    float luma = dot(val, lw);
-    return luma + sat * (val - luma);
+    color = max(color, 0.0);
+
+    float luma = dot(color, lw);
+    float highlightMask = smoothstep(0.56, 1.00, luma);
+    color *= mix(1.0, 0.965, highlightMask);
+
+    luma = dot(color, lw);
+    float saturation = mix(1.085, 1.040, highlightMask);
+    color = max(luma + (color - luma) * saturation, 0.0);
+
+    return color;
 }
 
 vec3 tex(vec2 uv) {
@@ -118,9 +122,8 @@ vec3 tex(vec2 uv) {
     vec3 color = bloomColor.rgb * gBloomMultiplier.rgb + rasterColor.rgb;
     color = max(color, 0.0);
     
-    color = agx(color);
-    color = agxLook(color);
-    color = agxEotf(color);
+    color = Tonemap_Uchimura(color);
+    color = applyColorGrade(color);
     
     return fromLinear(vec4(color, 1.0)).rgb;
 }

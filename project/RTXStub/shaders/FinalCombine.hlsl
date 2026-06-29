@@ -1,8 +1,6 @@
 #include "Include/Generated/Signature.hlsl"
 #include "Include/Util.hlsl"
 
-// Final Compositing Pass
-
 [numthreads(16, 16, 1)]
 void FinalCombine(
     uint3 dispatchThreadID : SV_DispatchThreadID,
@@ -16,8 +14,6 @@ void FinalCombine(
 
     uint diffuseDenoisingBufferIndex = g_rootConstant0 & 0xff;
     uint specularDenoisingBufferIndex = (g_rootConstant0 >> 8) & 0xff;
-    uint shadowDenoisingBufferIndex = (g_rootConstant0 >> 16) & 0xff;
-
 
     Texture2D<float4> denoisedDiffuseInput = denoisingInputs[diffuseDenoisingBufferIndex];
     float3 denoisedDiffuse = denoisedDiffuseInput[pixelPos].rgb;
@@ -30,10 +26,9 @@ void FinalCombine(
     float3 emission = outputBufferRayDirection[pixelPos].rgb;
 
     float3 diffuse = albedo * denoisedDiffuse;
-    
-    float3 finalColor = diffuse + denoisedSpecular + emission;
+    float3 combinedRadiance = diffuse + denoisedSpecular + emission;
 
-    finalColor = max(finalColor, 0.0);
+    combinedRadiance = max(combinedRadiance, 0.0);
     
-    outputBufferFinal[pixelPos] = float4(finalColor, 1.0);
+    outputBufferFinal[pixelPos] = float4(combinedRadiance, 1.0);
 }
