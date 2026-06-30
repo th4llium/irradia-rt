@@ -30,8 +30,8 @@ static const float TERRAIN_FULL_MOON_ILLUMINANCE_LUX = 0.25;
 static const float TERRAIN_LUX_TO_ENGINE_RADIANCE = 1.0 / 30000.0;
 static const float3 TERRAIN_SOLAR_RGB_5778K = float3(1.0, 0.965, 0.86);
 
-static const float VL_FOG_MAX_DISTANCE = 1024.0;
-static const float VL_FOG_AIR_DENSITY = 0.023;
+static const float VL_FOG_MIN_DISTANCE = 96.0;
+static const float VL_FOG_TARGET_TRANSMITTANCE = 0.22;
 static const float VL_FOG_WATER_DENSITY = 0.025;
 static const float VL_FOG_AIR_EXTINCTION_SCALE = 17.0;
 
@@ -354,12 +354,18 @@ float3 RenderEngineSky(float3 viewDir, float3 sunDir, float3 moonDir)
 
 float GetVolumetricFogMaxDistance()
 {
-    return min(g_view.renderDistance, VL_FOG_MAX_DISTANCE);
+    return max(g_view.renderDistance, VL_FOG_MIN_DISTANCE);
+}
+
+float GetRenderDistanceFogExtinction()
+{
+    return -log(VL_FOG_TARGET_TRANSMITTANCE)
+        / max(GetVolumetricFogMaxDistance(), 1.0);
 }
 
 float GetVolumetricFogDensity(bool inWater)
 {
-    return inWater ? VL_FOG_WATER_DENSITY : VL_FOG_AIR_DENSITY;
+    return inWater ? VL_FOG_WATER_DENSITY : GetRenderDistanceFogExtinction();
 }
 
 float3 GetVolumetricFogMediaExtinction(bool inWater)
@@ -371,7 +377,7 @@ float3 GetVolumetricFogMediaExtinction(bool inWater)
     float3 extinction = max(
         g_view.mediaExtinction[MEDIA_TYPE_AIR].rgb,
         0.0);
-    return extinction * VL_FOG_AIR_EXTINCTION_SCALE;
+    return max(extinction * VL_FOG_AIR_EXTINCTION_SCALE, (1.0).xxx);
 }
 
 float3 CalcFogTransmittance(float distance, float3 extinction)
@@ -554,11 +560,18 @@ float3 GetTransparentEnvironmentSky(float3 rayDir)
     float3 sunDir = getOffsetTrueDirectionToSun();
     float3 moonDir = getOffsetTrueDirectionToMoon();
     float3 envDir = safeNormalize(rayDir, float3(0, 1, 0));
+    float belowHorizon = 1.0 - smoothstep(-0.16, 0.06, envDir.y);
 
-    envDir.y = max(envDir.y, 0.035);
-    envDir = safeNormalize(envDir, float3(0, 1, 0));
+    float3 liftedDir = envDir;
+    liftedDir.y = max(
+        liftedDir.y,
+        lerp(0.11, 0.035, saturate(envDir.y * 8.0 + 0.5)));
+    liftedDir = safeNormalize(liftedDir, float3(0, 1, 0));
 
-    float3 color = RenderEngineSky(envDir, sunDir, moonDir);
+    float3 color = lerp(
+        RenderEngineSky(envDir, sunDir, moonDir),
+        RenderEngineSky(liftedDir, sunDir, moonDir),
+        belowHorizon);
     if (getLuminance(color) < 1.0e-5) {
         float3 ambient;
         float ambientLux;

@@ -75,6 +75,58 @@ float3 EvaluateVolumetricLocalLights(
     return localScattering;
 }
 
+float GetAirFogSampleWeight(
+    float3 position,
+    float sampleDepth,
+    float maxDistance)
+{
+    float nearDistance = max(maxDistance * 0.04, 8.0);
+    float fullDistance = max(maxDistance * 0.22, nearDistance + 1.0);
+    float distanceProfile =
+        lerp(
+            0.18,
+            1.0,
+            smoothstep(nearDistance, fullDistance, sampleDepth));
+    float heightProfile =
+        lerp(
+            1.20,
+            0.62,
+            smoothstep(96.0, 320.0, position.y));
+    float farBoost =
+        lerp(
+            1.0,
+            1.18,
+            smoothstep(maxDistance * 0.65, maxDistance, sampleDepth));
+    return distanceProfile * heightProfile * farBoost;
+}
+
+float GetAverageAirFogSampleWeight(
+    float3 rayDirection,
+    float zSliceMin,
+    float zSliceMax,
+    float maxDistance,
+    float dither)
+{
+    float sampleCount = max((float)VOLUMETRIC_STEPS, 1.0);
+    float weightSum = 0.0;
+
+    [loop]
+    for (int sampleIndex = 0; sampleIndex < VOLUMETRIC_STEPS; ++sampleIndex)
+    {
+        float sample01 = ((float)sampleIndex + dither) / sampleCount;
+        float sampleZ = lerp(zSliceMin, zSliceMax, sample01);
+        float sampleDepth = sampleZ * sampleZ * maxDistance;
+        float3 samplePosition =
+            g_view.viewOriginSteveSpace + rayDirection * sampleDepth;
+        weightSum += GetAirFogSampleWeight(
+            samplePosition,
+            sampleDepth,
+            maxDistance);
+    }
+
+    return weightSum / sampleCount;
+}
+
 [numthreads(4, 4, 2)]
 void CalculateInscatterInline(
     uint3 dispatchThreadID : SV_DispatchThreadID,
@@ -89,7 +141,9 @@ void CalculateInscatterInline(
     ndc = ndc * 2.0 - 1.0;
     ndc.y = -ndc.y;
 
-    float zSlice = ((float)dispatchThreadID.z + 0.5) / 64.0;
+    float zSliceMin = (float)dispatchThreadID.z / 64.0;
+    float zSliceMax = ((float)dispatchThreadID.z + 1.0) / 64.0;
+    float zSlice = (zSliceMin + zSliceMax) * 0.5;
     float maxDist = GetVolumetricFogMaxDistance();
     float depth = zSlice * zSlice * maxDist;
 
@@ -97,7 +151,9 @@ void CalculateInscatterInline(
     float3 pos = g_view.viewOriginSteveSpace + rayDir * depth;
 
     bool isUnderwater = g_view.cameraIsUnderWater;
-    float fogDensity = isUnderwater ? 0.025 : GetVolumetricFogDensity(false);
+    float fogDensity = isUnderwater
+        ? GetWaterScalarExtinction()
+        : GetVolumetricFogDensity(false);
 
     float3 sunDir = getOffsetTrueDirectionToSun();
     float3 moonDir = getOffsetTrueDirectionToMoon();
@@ -109,9 +165,17 @@ void CalculateInscatterInline(
 
     uint3 noiseCoord = uint3(
         dispatchThreadID.xy % uint2(256, 256),
-        g_view.frameCount % 128);
+        dispatchThreadID.z % 128);
     float4 noise = blueNoiseTexture.Load(uint4(noiseCoord, 0));
     float dither = noise.x;
+    float airFogSampleWeight = isUnderwater
+        ? 1.0
+        : GetAverageAirFogSampleWeight(
+            rayDir,
+            zSliceMin,
+            zSliceMax,
+            maxDist,
+            dither);
 
     float shadow = 1.0;
     float3 shadowLightDir = mainLightDir;
@@ -147,7 +211,7 @@ void CalculateInscatterInline(
     float extinction = 0.0;
     float3 localMediaScattering = 0.0;
     if (isUnderwater) {
-        float3 waterScatteringColor = float3(0.1, 0.8, 0.9) * 0.025;
+        float3 waterScatteringColor = GetWaterScatteringCoefficient();
         float waterExtinction = fogDensity;
         scattering =
             mainRadiance
@@ -170,7 +234,8 @@ void CalculateInscatterInline(
         float uniformPhase = 1.0 / (4.0 * PI);
         float fogExtinction =
             fogDensity
-            * max(getLuminance(mediaExtinction), 1.0e-4);
+            * getLuminance(mediaExtinction)
+            * airFogSampleWeight;
         float3 directLight =
             mainRadiance
             * mainLightFade

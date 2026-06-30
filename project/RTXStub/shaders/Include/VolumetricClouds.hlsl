@@ -20,7 +20,7 @@
 #endif
 
 #ifndef VOLUMETRIC_CLOUD_BASE_HEIGHT
-#define VOLUMETRIC_CLOUD_BASE_HEIGHT 200.0
+#define VOLUMETRIC_CLOUD_BASE_HEIGHT 300.0
 #endif
 
 #ifndef VOLUMETRIC_CLOUD_THICKNESS
@@ -60,11 +60,11 @@
 #endif
 
 #ifndef VOLUMETRIC_CLOUD_MAX_RENDER_DISTANCE
-#define VOLUMETRIC_CLOUD_MAX_RENDER_DISTANCE 7000.0
+#define VOLUMETRIC_CLOUD_MAX_RENDER_DISTANCE 3500.0
 #endif
 
 #ifndef VOLUMETRIC_CLOUD_FADE_DISTANCE
-#define VOLUMETRIC_CLOUD_FADE_DISTANCE 5000.0
+#define VOLUMETRIC_CLOUD_FADE_DISTANCE 3000.0
 #endif
 
 #ifndef VOLUMETRIC_CLOUD_TERRAIN_SHADOW_STRENGTH
@@ -72,7 +72,7 @@
 #endif
 
 #ifndef VOLUMETRIC_CLOUD_MAX_SHADOW_DISTANCE
-#define VOLUMETRIC_CLOUD_MAX_SHADOW_DISTANCE 6000.0
+#define VOLUMETRIC_CLOUD_MAX_SHADOW_DISTANCE 3500.0
 #endif
 
 #ifndef VOLUMETRIC_CLOUD_SHADOW_OD_CUTOFF
@@ -266,7 +266,7 @@ float GetVolumetricCloudDensity(float3 position)
     float time = g_view.time * VOLUMETRIC_CLOUD_SPEED * 15.0;
     const float scale = 0.1;
 
-    float twist = cloudHeight * 0.0003;
+    float twist = cloudHeight * 0.0009;
     float2 spiralWarp = float2(sin(twist), cos(twist)) * 8.0;
     float2 baseOffset = float2(4.0, 8.0);
 
@@ -281,7 +281,7 @@ float GetVolumetricCloudDensity(float3 position)
     if (density <= 0.0)
         return 0.0;
 
-    float2 detailWarp = float2(cos(twist * 2.5), sin(twist * 2.5)) * 4.0;
+    float2 detailWarp = float2(cos(twist * 2.5), sin(twist * 2.5)) * 16.0;
     float detailA = CloudNoise2D(
         (position.xz - detailWarp) * scale * 8.0
         - float2(0.2, 0.0) * time);
@@ -473,13 +473,6 @@ float3 GetDirectVolumetricCloudScattering(
         density / max(VOLUMETRIC_CLOUD_DENSITY, 0.0001);
     float powderEffect =
         CloudPowderEffect(normalizedDensity, cosTheta);
-    float scatteringFalloff =
-        0.55
-        * lerp(
-            pow(saturate(scatterAmount / 0.1), 0.33),
-            1.0,
-            cosTheta * 0.5 + 0.5);
-
     float phase = CloudPhaseSingle(cosTheta);
     float phasePower = 1.0 + lightOpticalDepth;
     float3 phaseG =
@@ -511,6 +504,12 @@ float3 GetDirectVolumetricCloudScattering(
             * exp(-extinctAmount * skyOpticalDepth)
             * isotropicPhase;
 
+        float scatteringFalloff =
+            0.55
+            * lerp(
+                pow(saturate(scatterAmount / 0.4), 0.33),
+                1.0,
+                cosTheta * 0.5 + 0.5);
         scatterAmount *= scatteringFalloff * powderEffect;
         extinctAmount *= 0.4;
         phaseG *= 0.8;
@@ -702,7 +701,7 @@ void ComputeDirectVolumetricClouds(
     }
 
     float farBlend =
-        saturate(startDist * 0.00001);
+        saturate(startDist / max(VOLUMETRIC_CLOUD_MAX_RENDER_DISTANCE, 1.0));
     float3 skyFallback = skyColorNoSun * (1.0 - transmittance);
 
     outTransmittance = transmittance;

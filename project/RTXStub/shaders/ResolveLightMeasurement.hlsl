@@ -1,8 +1,8 @@
 #include "Include/Generated/Signature.hlsl"
 
-static const float kDesiredBrightness = 0.14;
-static const float kMinExposureEv = -15.5;
-static const float kMaxExposureEv = 2.10;
+static const float kDesiredBrightness = 0.095;
+static const float kMinExposureEv = -16.0;
+static const float kMaxExposureEv = 1.20;
 
 [numthreads(1, 1, 1)]
 void ResolveLightMeasurement(

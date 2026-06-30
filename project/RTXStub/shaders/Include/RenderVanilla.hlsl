@@ -57,6 +57,39 @@ float3 ClampIndirectRadiance(float3 radiance, float maxLuminance)
         : radiance;
 }
 
+float GetEnvironmentCloudDither(float3 position, float3 direction)
+{
+    float2 hashInput =
+        position.xz * 0.071
+        + direction.xy * 17.0
+        + (float)(g_view.frameCount & 127u) * float2(0.17, 0.31);
+    return Hash21(hashInput);
+}
+
+float3 GetCloudyTransparentEnvironmentSky(
+    float3 origin,
+    float3 direction,
+    float dither)
+{
+    float3 rayDirection = safeNormalize(direction, float3(0, 1, 0));
+    float3 environment = GetTransparentEnvironmentSky(rayDirection);
+
+#if ENABLE_VOLUMETRIC_CLOUDS
+    float cloudTransmittance;
+    float3 cloudInscatter;
+    ComputeDirectVolumetricClouds(
+        origin,
+        rayDirection,
+        65504.0,
+        dither,
+        cloudTransmittance,
+        cloudInscatter);
+    environment = environment * cloudTransmittance + cloudInscatter;
+#endif
+
+    return max(environment, 0.0);
+}
+
 float3 EvaluateDielectricReflectionAmbient(
     HitInfo hitInfo,
     ObjectInstance objectInstance)
@@ -160,7 +193,10 @@ float3 TraceDielectricReflectionProbe(
             64.0);
     }
 
-    return GetTransparentEnvironmentSky(direction);
+    return GetCloudyTransparentEnvironmentSky(
+        reflectionRay.Origin,
+        direction,
+        GetEnvironmentCloudDither(position, direction));
 }
 
 float3 GetSurfaceMediumExtinction(
@@ -175,12 +211,7 @@ float3 GetSurfaceMediumExtinction(
         g_view.mediaExtinction[min(mediumType, 4u)].rgb,
         0.0);
     if (mediumType == MEDIA_TYPE_WATER) {
-        float3 clearWaterExtinction =
-            float3(0.8, 0.2, 0.05) * 0.0125;
-        if (!any(engineExtinction > 0.0))
-            return clearWaterExtinction;
-
-        return min(engineExtinction, clearWaterExtinction * 2.0);
+        return GetWaterExtinctionCoefficient(engineExtinction);
     }
     return engineExtinction;
 }
@@ -536,7 +567,10 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
                 if (missingF > 0.01) {
                     float3 missingDir = isReflection ? refrDir : reflDir;
                     float3 missingSkyRadiance =
-                        GetTransparentEnvironmentSky(missingDir);
+                        GetCloudyTransparentEnvironmentSky(
+                            surfaceInfo.position,
+                            missingDir,
+                            GetBlueNoise1D(rayState));
                     float3 missingContrib = missingSkyRadiance * missingF;
                     rayState.color += missingContrib * rayState.throughput
                         * (eventProbability / max(eventResponse, 0.0001));

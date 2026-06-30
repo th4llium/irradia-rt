@@ -149,20 +149,22 @@ void PrimaryCheckerboardRayGenInline(
     specularRadiance *= transmittance;
     emission = emission * transmittance + inscatter;
 
-    uint3 cloudNoiseCoord = uint3(
-        dispatchThreadID.xy % uint2(256, 256),
-        0);
-    float cloudDither =
-        blueNoiseTexture.Load(uint4(cloudNoiseCoord, 0)).r;
-    float cloudTransmittance;
-    float3 cloudInscatter;
-    ComputeDirectVolumetricClouds(
-        rayDesc.Origin,
-        rayDesc.Direction,
-        primaryDepth,
-        cloudDither,
-        cloudTransmittance,
-        cloudInscatter);
+    float cloudTransmittance = 1.0;
+    float3 cloudInscatter = 0.0;
+    if (!hitGlass && !g_view.cameraIsUnderWater) {
+        uint3 cloudNoiseCoord = uint3(
+            dispatchThreadID.xy % uint2(256, 256),
+            0);
+        float cloudDither =
+            blueNoiseTexture.Load(uint4(cloudNoiseCoord, 0)).r;
+        ComputeDirectVolumetricClouds(
+            rayDesc.Origin,
+            rayDesc.Direction,
+            primaryDepth,
+            cloudDither,
+            cloudTransmittance,
+            cloudInscatter);
+    }
     diffuseIrradiance *= cloudTransmittance;
     specularRadiance *= cloudTransmittance;
     emission = emission * cloudTransmittance + cloudInscatter;

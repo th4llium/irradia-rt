@@ -4,6 +4,43 @@
 #include "Generated/Signature.hlsl"
 #include "Util.hlsl"
 
+#ifndef WATER_ABSORPTION_SCALE
+#define WATER_ABSORPTION_SCALE 0.045
+#endif
+
+#ifndef WATER_SCATTERING_SCALE
+#define WATER_SCATTERING_SCALE 0.032
+#endif
+
+static const float3 WATER_ABSORPTION_TINT = float3(1.0, 0.32, 0.075);
+static const float3 WATER_SCATTERING_TINT = float3(0.035, 0.36, 1.0);
+
+float3 GetWaterExtinctionCoefficient()
+{
+    return WATER_ABSORPTION_TINT * WATER_ABSORPTION_SCALE;
+}
+
+float3 GetWaterExtinctionCoefficient(float3 engineExtinction)
+{
+    float engineStrength = max(
+        max(engineExtinction.r, engineExtinction.g),
+        engineExtinction.b);
+    float strengthScale =
+        max(engineStrength, WATER_ABSORPTION_SCALE)
+        / WATER_ABSORPTION_SCALE;
+    return GetWaterExtinctionCoefficient() * strengthScale;
+}
+
+float GetWaterScalarExtinction()
+{
+    return max(getLuminance(GetWaterExtinctionCoefficient()), 1.0e-4);
+}
+
+float3 GetWaterScatteringCoefficient()
+{
+    return WATER_SCATTERING_TINT * WATER_SCATTERING_SCALE;
+}
+
 float hash1_water(float2 p)
 {
     p = 50.0 * frac(p * 0.3183099);
@@ -165,8 +202,7 @@ float CalcProceduralWaterCaustics(float3 waterHitPosition, float receiverToWater
 float3 CalcWaterCausticTransmission(float3 waterHitPosition, float receiverToWaterDistance)
 {
     float caustics = CalcProceduralWaterCaustics(waterHitPosition, receiverToWaterDistance);
-    float3 waterExtinction =
-        float3(0.8, 0.2, 0.05) * 0.0125;
+    float3 waterExtinction = GetWaterExtinctionCoefficient();
     float3 waterTransmittance = exp(-waterExtinction * max(receiverToWaterDistance, 0.0));
     return waterTransmittance * caustics;
 }

@@ -132,11 +132,8 @@ struct RayState
         if (g_view.cameraIsUnderWater) {
             mediumStack[1] = MEDIA_TYPE_WATER;
             float3 waterExtinction = max(g_view.mediaExtinction[MEDIA_TYPE_WATER].rgb, 0.0);
-            mediumExtinctionStack[1] = any(waterExtinction > 0.0)
-                ? min(
-                    waterExtinction,
-                    float3(0.8, 0.2, 0.05) * 0.025)
-                : float3(0.8, 0.2, 0.05) * 0.0125;
+            mediumExtinctionStack[1] =
+                GetWaterExtinctionCoefficient(waterExtinction);
         }
         primaryLobe = kPrimaryLobeNone;
         hasRayCone = false;
@@ -324,7 +321,12 @@ void RenderRayDenoised(
                 
                 float3 mainRadiance = lerp(moonRadiance, sunRadiance, isSun);
                 
-                float3 scatterColor = float3(0.1, 0.8, 0.9) * 0.05 * phaseHG * (1.0 - exp(-0.025 * dist));
+                float waterFogDepth =
+                    1.0 - exp(-GetWaterScalarExtinction() * max(dist, 0.0));
+                float3 scatterColor =
+                    GetWaterScatteringCoefficient()
+                    * phaseHG
+                    * waterFogDepth;
                 float3 scatter = scatterColor * rayState.throughput * mainRadiance * lerp(moonFade, sunFade, isSun);
                 
                 rayState.color += scatter;
@@ -350,6 +352,23 @@ void RenderRayDenoised(
                     rayState.throughput
                     * GetTransparentEnvironmentSky(
                         rayState.rayDesc.Direction);
+                rayState.color = colorBefore + skyContribution;
+            }
+            if (rayState.foundPrimarySurface
+                || rayState.primaryDielectricSurfaceSeen)
+            {
+                float cloudTransmittance;
+                float3 cloudInscatter;
+                ComputeDirectVolumetricClouds(
+                    rayState.rayDesc.Origin,
+                    rayState.rayDesc.Direction,
+                    65504.0,
+                    GetBlueNoise1D(rayState),
+                    cloudTransmittance,
+                    cloudInscatter);
+                skyContribution =
+                    skyContribution * cloudTransmittance
+                    + rayState.throughput * cloudInscatter;
                 rayState.color = colorBefore + skyContribution;
             }
             
