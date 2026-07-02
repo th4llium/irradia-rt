@@ -105,11 +105,15 @@ vec3 applyColorGrade(vec3 color) {
     color = max(color, 0.0);
 
     float luma = dot(color, lw);
-    float highlightMask = smoothstep(0.56, 1.00, luma);
-    color *= mix(1.0, 0.965, highlightMask);
+    float shadowMask = 1.0 - smoothstep(0.055, 0.34, luma);
+    color *= mix(1.0, 0.92, shadowMask);
 
     luma = dot(color, lw);
-    float saturation = mix(1.085, 1.040, highlightMask);
+    float highlightMask = smoothstep(0.56, 1.00, luma);
+    color *= mix(1.0, 0.985, highlightMask);
+
+    luma = dot(color, lw);
+    float saturation = mix(1.145, 1.075, highlightMask);
     color = max(luma + (color - luma) * saturation, 0.0);
 
     return color;

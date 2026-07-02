@@ -52,7 +52,8 @@ float3 EvaluateVolumetricLocalLights(
 
         float attenuation =
             rangeFade
-            / max(distanceSq + radiusSq, 1.0);
+            * (1.0 + radiusSq)
+            / max(distanceSq + radiusSq, 0.001);
         float cosTheta = dot(viewDirection, lightDirection);
         float localPhase = lerp(
             1.0 / (4.0 * PI),
@@ -60,8 +61,9 @@ float3 EvaluateVolumetricLocalLights(
             0.45);
         float3 lightRadiance =
             lightData.color
-            * lightData.intensity
-            * 700.0
+            * GetLocalLightIntensityWeight(lightData.intensity)
+            * PERF_EMISSIVE_LIGHT_INTENSITY_SCALE
+            * PERF_LOCAL_LIGHT_RADIANCE_SCALE
             * VOLUMETRIC_LOCAL_LIGHT_INTENSITY
             * attenuation
             * visibility;
@@ -81,21 +83,21 @@ float GetAirFogSampleWeight(
     float maxDistance)
 {
     float nearDistance = max(maxDistance * 0.04, 8.0);
-    float fullDistance = max(maxDistance * 0.22, nearDistance + 1.0);
+    float fullDistance = max(maxDistance * 0.14, nearDistance + 1.0);
     float distanceProfile =
         lerp(
-            0.18,
+            0.38,
             1.0,
             smoothstep(nearDistance, fullDistance, sampleDepth));
     float heightProfile =
         lerp(
-            1.20,
-            0.62,
+            1.08,
+            0.72,
             smoothstep(96.0, 320.0, position.y));
     float farBoost =
         lerp(
             1.0,
-            1.18,
+            1.10,
             smoothstep(maxDistance * 0.65, maxDistance, sampleDepth));
     return distanceProfile * heightProfile * farBoost;
 }
@@ -180,7 +182,7 @@ void CalculateInscatterInline(
     float shadow = 1.0;
     float3 shadowLightDir = mainLightDir;
 #if VOLUMETRIC_SHADOW_RAYS >= 1
-    float3 jitteredDir = sampleCelestialLightDisk(mainLightDir, noise.xy);
+    float3 jitteredDir = mainLightDir;
     shadowLightDir = jitteredDir;
 
     RayDesc shadowRay;
@@ -195,7 +197,7 @@ void CalculateInscatterInline(
     shadow *= GetVolumetricCloudShadowTransmission(
         pos,
         shadowLightDir,
-        dither);
+        0.5);
 
     float3 sunRadiance; float sunLux;
     GetSunColorAndLux(pos, sunDir, sunRadiance, sunLux);
@@ -204,8 +206,12 @@ void CalculateInscatterInline(
     float3 mainRadiance = lerp(moonRadiance, sunRadiance, isSun);
 
     float cosTheta = dot(rayDir, mainLightDir);
-    float g = isUnderwater ? 0.6 : 0.75;
-    float phase = (1.0 - g*g) / (4.0 * PI * pow(max(1.0 + g*g - 2.0*g*cosTheta, 0.001), 1.5));
+    float uniformPhase = 1.0 / (4.0 * PI);
+    float g = isUnderwater ? 0.6 : 0.52;
+    float hgPhase = (1.0 - g*g) / (4.0 * PI * pow(max(1.0 + g*g - 2.0*g*cosTheta, 0.001), 1.5));
+    float phase = isUnderwater
+        ? hgPhase
+        : lerp(uniformPhase, hgPhase, 0.58);
 
     float3 scattering = 0.0;
     float extinction = 0.0;
@@ -231,7 +237,6 @@ void CalculateInscatterInline(
     } else {
         float3 mediaExtinction = GetVolumetricFogMediaExtinction(false);
         float3 fogColor = GetFogColor(pos, rayDir, depth, sunDir, moonDir);
-        float uniformPhase = 1.0 / (4.0 * PI);
         float fogExtinction =
             fogDensity
             * getLuminance(mediaExtinction)
@@ -240,8 +245,9 @@ void CalculateInscatterInline(
             mainRadiance
             * mainLightFade
             * shadow
-            * phase;
-        float3 ambientLight = fogColor * uniformPhase;
+            * phase
+            * 0.62;
+        float3 ambientLight = fogColor * uniformPhase * 1.55;
         scattering = (directLight + ambientLight) * fogExtinction;
         extinction += fogExtinction;
         localMediaScattering = fogExtinction.xxx;

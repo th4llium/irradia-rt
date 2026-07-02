@@ -108,6 +108,14 @@ float get_water_height(float2 p, float time)
 #define WATER_CAUSTICS_DISTANCE_FADE 0.035
 #endif
 
+#ifndef WATER_CAUSTICS_MAX_PROJECTED_DEPTH
+#define WATER_CAUSTICS_MAX_PROJECTED_DEPTH 96.0
+#endif
+
+#ifndef WATER_CAUSTICS_SURFACE_BIAS
+#define WATER_CAUSTICS_SURFACE_BIAS 0.04
+#endif
+
 float4 WaterCausticMod289(float4 x)
 {
     return x - floor(x / 289.0) * 289.0;
@@ -205,6 +213,42 @@ float3 CalcWaterCausticTransmission(float3 waterHitPosition, float receiverToWat
     float3 waterExtinction = GetWaterExtinctionCoefficient();
     float3 waterTransmittance = exp(-waterExtinction * max(receiverToWaterDistance, 0.0));
     return waterTransmittance * caustics;
+}
+
+float3 GetWaterCausticPatternPosition(float3 waterSurfacePosition)
+{
+    float3 patternPosition =
+        waterSurfacePosition - g_view.waveWorksOriginInSteveSpace;
+    return patternPosition
+        - floor(patternPosition / 1024.0) * 1024.0;
+}
+
+bool TryGetProjectedWaterCausticTransmission(
+    float3 receiverPosition,
+    float3 lightDirection,
+    out float3 transmission)
+{
+    transmission = 1.0;
+
+    if (lightDirection.y <= 0.02)
+        return false;
+
+    float receiverToWaterDistance =
+        (g_view.waveWorksOriginInSteveSpace.y - receiverPosition.y)
+        / lightDirection.y;
+    if (receiverToWaterDistance <= WATER_CAUSTICS_SURFACE_BIAS
+        || receiverToWaterDistance > WATER_CAUSTICS_MAX_PROJECTED_DEPTH)
+    {
+        return false;
+    }
+
+    float3 waterSurfacePosition =
+        receiverPosition + lightDirection * receiverToWaterDistance;
+    transmission =
+        CalcWaterCausticTransmission(
+            GetWaterCausticPatternPosition(waterSurfacePosition),
+            receiverToWaterDistance);
+    return true;
 }
 
 float3 GetWaterNormal(float3 p, float time, float3 geomNormal) {

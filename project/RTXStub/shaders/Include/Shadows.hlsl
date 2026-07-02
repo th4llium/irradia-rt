@@ -10,27 +10,35 @@
 #endif
 
 #ifndef CELESTIAL_SHADOW_TEMPORAL_ALPHA
-#define CELESTIAL_SHADOW_TEMPORAL_ALPHA 0.08
+#define CELESTIAL_SHADOW_TEMPORAL_ALPHA 0.035
 #endif
 
 #ifndef CELESTIAL_SHADOW_MAX_HISTORY_LENGTH
-#define CELESTIAL_SHADOW_MAX_HISTORY_LENGTH 12.0
+#define CELESTIAL_SHADOW_MAX_HISTORY_LENGTH 64.0
 #endif
 
 #ifndef CELESTIAL_SHADOW_DISAGREEMENT_START
-#define CELESTIAL_SHADOW_DISAGREEMENT_START 0.55
+#define CELESTIAL_SHADOW_DISAGREEMENT_START 0.18
 #endif
 
 #ifndef CELESTIAL_SHADOW_DISAGREEMENT_END
-#define CELESTIAL_SHADOW_DISAGREEMENT_END 0.95
+#define CELESTIAL_SHADOW_DISAGREEMENT_END 0.62
 #endif
 
 #ifndef CELESTIAL_SHADOW_DISAGREEMENT_ALPHA
-#define CELESTIAL_SHADOW_DISAGREEMENT_ALPHA 0.85
+#define CELESTIAL_SHADOW_DISAGREEMENT_ALPHA 0.82
 #endif
 
 #ifndef CELESTIAL_SHADOW_MAX_TEMPORAL_TRANSMISSION
-#define CELESTIAL_SHADOW_MAX_TEMPORAL_TRANSMISSION 1.05
+#define CELESTIAL_SHADOW_MAX_TEMPORAL_TRANSMISSION 1.25
+#endif
+
+#ifndef CELESTIAL_SHADOW_TRANSMISSION_POWER
+#define CELESTIAL_SHADOW_TRANSMISSION_POWER 1.38
+#endif
+
+#ifndef CELESTIAL_SHADOW_DARKENING_ALPHA
+#define CELESTIAL_SHADOW_DARKENING_ALPHA 0.92
 #endif
 
 bool AlphaTestHitLogic(HitInfo hitInfo)
@@ -92,6 +100,14 @@ float3 GetShadowGlassExtinction(float3 color, float opacity)
         transmittancePerBlock, 0.02, 1.0)) * 0.65;
 }
 
+float3 ShapeSunShadowTransmission(float3 transmission)
+{
+    float3 shaped = pow(
+        saturate(transmission),
+        (CELESTIAL_SHADOW_TRANSMISSION_POWER).xxx);
+    return shaped + max(transmission - 1.0, 0.0);
+}
+
 float GetShadowGlassInterfaceTransmission(
     float3 rayDirection,
     float3 localGeometryNormal,
@@ -126,6 +142,7 @@ void TraceShadowRay(in RayDesc ray, out ShadowPayload payload)
     bool insideGlass = false;
     float glassEntryDistance = 0.0;
     float3 glassExtinction = 0.0;
+    bool hitWaterForCaustics = false;
 
     while (query.Proceed()) {
         HitInfo hitInfo;
@@ -206,12 +223,10 @@ void TraceShadowRay(in RayDesc ray, out ShadowPayload payload)
         else if (hitInfo.materialType == MATERIAL_TYPE_WATER) {
             float3 waterHitPosition =
                 ray.Origin + ray.Direction * hitInfo.rayT;
-            waterHitPosition -=
-                g_view.waveWorksOriginInSteveSpace;
-            waterHitPosition -=
-                floor(waterHitPosition / 1024.0) * 1024.0;
             transmission *= CalcWaterCausticTransmission(
-                waterHitPosition, hitInfo.rayT);
+                GetWaterCausticPatternPosition(waterHitPosition),
+                hitInfo.rayT);
+            hitWaterForCaustics = true;
         }
         else {
             query.CommitNonOpaqueTriangleHit();
@@ -227,6 +242,19 @@ void TraceShadowRay(in RayDesc ray, out ShadowPayload payload)
 
     if (insideGlass)
         transmission *= exp(-glassExtinction * 0.125);
+
+    if (!hitWaterForCaustics
+        && query.CommittedStatus() == COMMITTED_NOTHING)
+    {
+        float3 projectedWaterTransmission;
+        if (TryGetProjectedWaterCausticTransmission(
+            ray.Origin,
+            ray.Direction,
+            projectedWaterTransmission))
+        {
+            transmission *= projectedWaterTransmission;
+        }
+    }
 
     payload.transmission =
         query.CommittedStatus() == COMMITTED_NOTHING
@@ -251,7 +279,7 @@ float3 DecodeShadowHistoryNormal(float2 encoded)
 
 float GetShadowHistoryDepthTolerance(float pathLength)
 {
-    return 0.08 + min(max(pathLength, 0.0) * 0.005, 0.35);
+    return 0.05 + min(max(pathLength, 0.0) * 0.0025, 0.18);
 }
 
 float4 LoadReprojectedSunShadowHistory(
@@ -265,32 +293,31 @@ float4 LoadReprojectedSunShadowHistory(
     float2 previousPixelCenter =
         (float2)pixelCoord + 0.5
         + motionVector * (float2)g_view.renderResolution;
-    float2 previousPixelCorner = previousPixelCenter - 0.5;
-    int2 basePixel = int2(floor(previousPixelCorner));
-    float2 bilinear = frac(previousPixelCorner);
+    int2 basePixel = int2(floor(previousPixelCenter));
     int2 renderSize = int2(g_view.renderResolution);
     float previousPathLength = length(
         previousPosition - g_view.previousViewOriginSteveSpace);
     float depthTolerance =
         GetShadowHistoryDepthTolerance(previousPathLength);
+    float historyFilterRadius =
+        lerp(0.70, 1.05, smoothstep(96.0, 384.0, previousPathLength));
 
     float4 historySum = 0.0;
     float weightSum = 0.0;
     [loop]
-    for (int sampleIndex = 0; sampleIndex < 4; ++sampleIndex)
+    for (int sampleIndex = 0; sampleIndex < 9; ++sampleIndex)
     {
-        int2 offset = int2(sampleIndex & 1, sampleIndex >> 1);
+        int2 offset = int2(sampleIndex % 3, sampleIndex / 3) - 1;
         int2 samplePixel = basePixel + offset;
         if (any(samplePixel < 0) || any(samplePixel >= renderSize))
             continue;
 
-        float2 bilinearWeight = lerp(
-            1.0 - bilinear,
-            bilinear,
-            (float2)offset);
-        float weight = bilinearWeight.x * bilinearWeight.y;
-
         float2 sampleCenter = (float2)samplePixel + 0.5;
+        float2 historyDelta = sampleCenter - previousPixelCenter;
+        float weight =
+            exp2(
+                -dot(historyDelta, historyDelta)
+                / max(historyFilterRadius * historyFilterRadius, 1.0e-4));
         float2 previousNdc =
             (sampleCenter / (float2)g_view.renderResolution)
             * float2(2.0, -2.0)
@@ -322,8 +349,8 @@ float4 LoadReprojectedSunShadowHistory(
         float3 sampleNormal = DecodeShadowHistoryNormal(
             previousPrimaryNormalBuffer[samplePixel]);
         float normalWeight = smoothstep(
-            0.72,
-            0.95,
+            0.82,
+            0.97,
             dot(normal, sampleNormal));
         weight *= depthWeight * normalWeight;
         if (weight <= 0.0)
@@ -348,57 +375,10 @@ float3 ResolveTemporalSunShadow(
     float3 normal,
     float3 currentTransmission)
 {
-    float4 previousShadow = LoadReprojectedSunShadowHistory(
-        pixelCoord,
-        position,
-        previousPosition,
-        normal);
-    float previousHistoryLength = previousShadow.a * 255.0;
-    float maximumCurrentTransmission = max(
-        currentTransmission.r,
-        max(currentTransmission.g, currentTransmission.b));
-
-    if (previousHistoryLength <= 0.0
-        || g_view.numFramesSinceTeleport == 0
-        || maximumCurrentTransmission
-            > CELESTIAL_SHADOW_MAX_TEMPORAL_TRANSMISSION)
-    {
-        outputBufferSunLightShadow[pixelCoord] =
-            float4(currentTransmission, 1.0 / 255.0);
-        return currentTransmission;
-    }
-
-    previousHistoryLength = min(
-        previousHistoryLength,
-        CELESTIAL_SHADOW_MAX_HISTORY_LENGTH - 1.0);
-    float alpha = max(
-        1.0 / (previousHistoryLength + 1.0),
-        CELESTIAL_SHADOW_TEMPORAL_ALPHA);
-    float disagreement = max(
-        abs(previousShadow.r - currentTransmission.r),
-        max(
-            abs(previousShadow.g - currentTransmission.g),
-            abs(previousShadow.b - currentTransmission.b)));
-    float disagreementWeight = smoothstep(
-        CELESTIAL_SHADOW_DISAGREEMENT_START,
-        CELESTIAL_SHADOW_DISAGREEMENT_END,
-        disagreement);
-    alpha = max(
-        alpha,
-        disagreementWeight * CELESTIAL_SHADOW_DISAGREEMENT_ALPHA);
-
-    float3 resolvedTransmission =
-        lerp(previousShadow.rgb, currentTransmission, saturate(alpha));
-    float historyLength = lerp(
-        min(
-            previousHistoryLength + 1.0,
-            CELESTIAL_SHADOW_MAX_HISTORY_LENGTH),
-        1.0,
-        disagreementWeight);
-
+    currentTransmission = ShapeSunShadowTransmission(currentTransmission);
     outputBufferSunLightShadow[pixelCoord] =
-        float4(resolvedTransmission, historyLength / 255.0);
-    return resolvedTransmission;
+        float4(currentTransmission, 1.0 / 255.0);
+    return currentTransmission;
 }
 
 bool TraceOcclusionRay(in RayDesc ray)

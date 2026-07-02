@@ -116,7 +116,14 @@ void Reproject(
         disoccludedThisFrame = true;
 #endif
 
-        historyLength = min(historyLength, 64.0);
+        historyLength = min(
+            historyLength,
+            PERF_DIFFUSE_TEMPORAL_MAX_HISTORY);
+        prevDiffuse = ClipDiffuseHistory(
+            int2(pixelPos),
+            prevDiffuse,
+            currentDepth,
+            currentNormal);
         float previousRoughness = previousLinearRoughnessBuffer[prevPixel];
         float roughnessTolerance = lerp(0.04, 0.16, currentRoughness);
         bool specularHistoryValid =
@@ -146,7 +153,12 @@ void Reproject(
     }
 
 
-    float diffuseAlpha = max(1.0 / historyLength, 0.05);
+    historyLength = min(
+        historyLength,
+        PERF_DIFFUSE_TEMPORAL_MAX_HISTORY);
+    float diffuseAlpha = max(
+        1.0 / historyLength,
+        PERF_DIFFUSE_TEMPORAL_MIN_ALPHA);
     float3 blendedDiffuse = lerp(prevDiffuse, currentDiffuse.rgb, diffuseAlpha);
 
     float diffuseLum = getLuminance(currentDiffuse.rgb);

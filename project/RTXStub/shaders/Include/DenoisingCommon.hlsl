@@ -3,6 +3,50 @@
 
 #include "Util.hlsl"
 
+#ifndef DEBUG_DISABLE_SVGF
+#define DEBUG_DISABLE_SVGF 0
+#endif
+
+#ifndef PERF_SVGF_ATROUS_MAX_ITERATION
+#define PERF_SVGF_ATROUS_MAX_ITERATION 5
+#endif
+
+#ifndef PERF_DIFFUSE_TEMPORAL_MIN_ALPHA
+#define PERF_DIFFUSE_TEMPORAL_MIN_ALPHA 0.05
+#endif
+
+#ifndef PERF_DIFFUSE_TEMPORAL_MAX_HISTORY
+#define PERF_DIFFUSE_TEMPORAL_MAX_HISTORY 64.0
+#endif
+
+#ifndef PERF_DIFFUSE_HISTORY_CLIP_RANGE_SCALE
+#define PERF_DIFFUSE_HISTORY_CLIP_RANGE_SCALE 0.35
+#endif
+
+#ifndef PERF_DIFFUSE_HISTORY_CLIP_RELATIVE_EPSILON
+#define PERF_DIFFUSE_HISTORY_CLIP_RELATIVE_EPSILON 0.08
+#endif
+
+#ifndef PERF_DIFFUSE_HISTORY_CLIP_ABSOLUTE_EPSILON
+#define PERF_DIFFUSE_HISTORY_CLIP_ABSOLUTE_EPSILON 0.01
+#endif
+
+#ifndef PERF_SVGF_DIFFUSE_NORMAL_EXPONENT
+#define PERF_SVGF_DIFFUSE_NORMAL_EXPONENT 128.0
+#endif
+
+#ifndef PERF_SVGF_DIFFUSE_LUMINANCE_SIGMA
+#define PERF_SVGF_DIFFUSE_LUMINANCE_SIGMA 4.0
+#endif
+
+#ifndef PERF_SVGF_DEPTH_RELATIVE_SCALE
+#define PERF_SVGF_DEPTH_RELATIVE_SCALE 64.0
+#endif
+
+#ifndef PERF_SVGF_DEPTH_ABSOLUTE_SCALE
+#define PERF_SVGF_DEPTH_ABSOLUTE_SCALE 0.75
+#endif
+
 float3 DecodeDenoiserNormal(float2 encoded)
 {
     float3 normal = float3(
@@ -124,6 +168,48 @@ float3 ClipSpecularHistory(
     return clamp(history, neighborhoodMin - margin, neighborhoodMax + margin);
 }
 
+float3 ClipDiffuseHistory(
+    int2 pixel,
+    float3 history,
+    float depth,
+    float3 normal)
+{
+    float3 neighborhoodMin = outputBufferIndirectDiffuse[pixel].rgb;
+    float3 neighborhoodMax = neighborhoodMin;
+    int2 renderSize = int2(g_view.renderResolution);
+
+    [unroll]
+    for (int y = -1; y <= 1; ++y)
+    {
+        [unroll]
+        for (int x = -1; x <= 1; ++x)
+        {
+            int2 samplePixel = pixel + int2(x, y);
+            if (any(samplePixel < 0) || any(samplePixel >= renderSize))
+                continue;
+
+            float sampleDepth = inputBufferPrimaryPathLength[samplePixel];
+            float depthDelta = abs(sampleDepth - depth) / max(depth, 0.001);
+            float3 sampleNormal =
+                DecodeDenoiserNormal(inputBufferNormal[samplePixel]);
+            if (depthDelta > 0.04 || dot(normal, sampleNormal) < 0.82)
+                continue;
+
+            float3 sample = outputBufferIndirectDiffuse[samplePixel].rgb;
+            neighborhoodMin = min(neighborhoodMin, sample);
+            neighborhoodMax = max(neighborhoodMax, sample);
+        }
+    }
+
+    float3 range = neighborhoodMax - neighborhoodMin;
+    float3 margin =
+        range * PERF_DIFFUSE_HISTORY_CLIP_RANGE_SCALE
+        + max(
+            neighborhoodMax * PERF_DIFFUSE_HISTORY_CLIP_RELATIVE_EPSILON,
+            (PERF_DIFFUSE_HISTORY_CLIP_ABSOLUTE_EPSILON).xxx);
+    return clamp(history, neighborhoodMin - margin, neighborhoodMax + margin);
+}
+
 float AtrousNormalWeight(float3 center, float3 sample, float exponent)
 {
     return pow(saturate(dot(center, sample)), exponent);
@@ -138,7 +224,9 @@ float AtrousDepthWeight(float center, float sample)
 {
     float depthDelta = abs(center - sample);
     float relativeDepth = depthDelta / max(center, 0.001);
-    return exp(-relativeDepth * 64.0 - depthDelta * 0.75);
+    return exp(
+        -relativeDepth * PERF_SVGF_DEPTH_RELATIVE_SCALE
+        -depthDelta * PERF_SVGF_DEPTH_ABSOLUTE_SCALE);
 }
 
 void FilterAtrousPixel(int2 pixel)
@@ -152,16 +240,29 @@ void FilterAtrousPixel(int2 pixel)
     Texture2D<float4> inputSignal = denoisingInputs[inputIndex];
     RWTexture2D<float4> outputSignal = denoisingOutputs[outputIndex];
 
+#if DEBUG_DISABLE_SVGF
+    outputSignal[pixel] = inputSignal[pixel];
+    return;
+#endif
+
     float depth = inputBufferPrimaryPathLength[pixel];
     if (depth >= 65000.0)
         return;
 
     float4 center = inputSignal[pixel];
+#if PERF_SVGF_ATROUS_MAX_ITERATION < 5
+    if (iteration > PERF_SVGF_ATROUS_MAX_ITERATION)
+    {
+        outputSignal[pixel] = center;
+        return;
+    }
+#endif
+
     float3 centerNormal = DecodeDenoiserNormal(inputBufferNormal[pixel]);
     float centerLuminance = getLuminance(center.rgb);
     float centerVariance = center.a;
-    float normalExponent = 128.0;
-    float luminanceSigma = 4.0;
+    float normalExponent = PERF_SVGF_DIFFUSE_NORMAL_EXPONENT;
+    float luminanceSigma = PERF_SVGF_DIFFUSE_LUMINANCE_SIGMA;
 
     float historyLength = outputBufferHistoryLength[pixel][
         paramsIndex == 1 ? 1 : 0] * 255.0;
@@ -233,6 +334,11 @@ void FilterMomentPixel(int2 pixel)
     uint outputIndex = (g_rootConstant0 >> 8) & 0xff;
     Texture2D<float2> inputMoments = denoisingMomentsInputs[inputIndex];
     float2 centerMoments = inputMoments[pixel];
+
+#if DEBUG_DISABLE_SVGF
+    outputDenoisingMoments[outputIndex][pixel] = centerMoments;
+    return;
+#endif
 
     float depth = inputBufferPrimaryPathLength[pixel];
     float historyLength = outputBufferHistoryLength[pixel].x * 255.0;

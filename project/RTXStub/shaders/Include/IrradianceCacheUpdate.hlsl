@@ -15,7 +15,7 @@
 #endif
 
 #ifndef IRRADIANCE_CACHE_MIN_UPDATE_ALPHA
-#define IRRADIANCE_CACHE_MIN_UPDATE_ALPHA 0.04
+#define IRRADIANCE_CACHE_MIN_UPDATE_ALPHA 0.025
 #endif
 
 #ifndef IRRADIANCE_CACHE_RAYS_PER_HEMISPHERE
@@ -24,6 +24,22 @@
 
 #ifndef IRRADIANCE_CACHE_EMISSIVE_SCALE
 #define IRRADIANCE_CACHE_EMISSIVE_SCALE PERF_EMISSIVE_CACHE_SURFACE_SCALE
+#endif
+
+#ifndef IRRADIANCE_CACHE_BRIGHT_SAMPLE_CLAMP
+#define IRRADIANCE_CACHE_BRIGHT_SAMPLE_CLAMP 4.0
+#endif
+
+#ifndef IRRADIANCE_CACHE_BRIGHT_SAMPLE_BIAS
+#define IRRADIANCE_CACHE_BRIGHT_SAMPLE_BIAS 2.0
+#endif
+
+#ifndef IRRADIANCE_CACHE_BRIGHT_CHANGE_ALPHA
+#define IRRADIANCE_CACHE_BRIGHT_CHANGE_ALPHA 0.55
+#endif
+
+#ifndef IRRADIANCE_CACHE_DARK_CHANGE_ALPHA
+#define IRRADIANCE_CACHE_DARK_CHANGE_ALPHA 0.65
 #endif
 
 struct IrradianceCacheLightData
@@ -121,14 +137,34 @@ float3 BlendCacheHistory(
     previousValue = ClampCachedIrradiance(previousValue);
     sampleValue = ClampCachedIrradiance(sampleValue);
 
-    float alpha = max(
-        1.0 / (min(historyLength, historyLimit - 1.0) + 1.0),
-        IRRADIANCE_CACHE_MIN_UPDATE_ALPHA);
-
     float previousLuminance =
         dot(previousValue, float3(0.2126, 0.7152, 0.0722));
     float sampleLuminance =
         dot(sampleValue, float3(0.2126, 0.7152, 0.0722));
+    float brightRise =
+        saturate(
+            (sampleLuminance - previousLuminance)
+            / max(max(sampleLuminance, previousLuminance), 0.05));
+
+    if (historyLength >= 3.0
+        && sampleLuminance > previousLuminance
+        && brightRise < 0.70)
+    {
+        float maxBrightSample = max(
+            previousLuminance * IRRADIANCE_CACHE_BRIGHT_SAMPLE_CLAMP
+                + IRRADIANCE_CACHE_BRIGHT_SAMPLE_BIAS,
+            IRRADIANCE_CACHE_BRIGHT_SAMPLE_BIAS);
+        if (sampleLuminance > maxBrightSample)
+        {
+            sampleValue *=
+                maxBrightSample / max(sampleLuminance, 1.0e-4);
+            sampleLuminance = maxBrightSample;
+        }
+    }
+
+    float alpha = max(
+        1.0 / (min(historyLength, historyLimit - 1.0) + 1.0),
+        IRRADIANCE_CACHE_MIN_UPDATE_ALPHA);
     float relativeLuminanceChange =
         abs(sampleLuminance - previousLuminance)
         / max(max(previousLuminance, sampleLuminance), 0.05);
@@ -138,9 +174,17 @@ float3 BlendCacheHistory(
     float signalChange = max(
         relativeLuminanceChange,
         relativeColorChange);
+    float changeAlpha =
+        saturate((signalChange - 0.12) * 1.4)
+        * (sampleLuminance > previousLuminance
+            ? IRRADIANCE_CACHE_BRIGHT_CHANGE_ALPHA
+            : IRRADIANCE_CACHE_DARK_CHANGE_ALPHA);
+    changeAlpha = max(
+        changeAlpha,
+        smoothstep(0.18, 0.75, brightRise) * 0.75);
     alpha = max(
         alpha,
-        saturate((signalChange - 0.12) * 1.4) * 0.55);
+        changeAlpha);
 
     return ClampCachedIrradiance(
         lerp(previousValue, sampleValue, saturate(alpha)));
@@ -210,14 +254,7 @@ float3 EvaluateCacheDirectIrradiance(
 
     float3 irradiance = 0.0;
 
-    float2 shadowSample = hash32(
-        position.xz * 0.173
-        + float2(
-            (float)g_view.frameCount * 0.754877666,
-            (float)g_view.frameCount * 0.569840296)).xy;
-    float3 sampledMainLightDirection = sampleCelestialLightDisk(
-        mainLightDirection,
-        shadowSample);
+    float3 sampledMainLightDirection = mainLightDirection;
     float mainNdotL = dot(normal, sampledMainLightDirection);
     if (mainNdotL > 0.0)
     {
@@ -229,6 +266,8 @@ float3 EvaluateCacheDirectIrradiance(
 
         ShadowPayload shadowPayload;
         TraceShadowRay(shadowRay, shadowPayload);
+        float3 shadowTransmission =
+            ShapeSunShadowTransmission(shadowPayload.transmission);
 
         float3 sunRadiance;
         float sunLux;
@@ -247,19 +286,46 @@ float3 EvaluateCacheDirectIrradiance(
         irradiance += mainRadiance
             * 0.75
             * mainLightFade
-            * shadowPayload.transmission
+            * shadowTransmission
             * mainNdotL
             * PI
             * exposure;
     }
 
+    int totalLightCount =
+        (int)g_view.cpuLightsCount;
     int lightCount = min(
         IRRADIANCE_CACHE_POINT_LIGHT_COUNT,
-        (int)g_view.cpuLightsCount);
+        totalLightCount);
+    uint cacheLightSeed =
+        GetIrradianceCacheSeed(
+            position,
+            normal,
+            g_view.frameCount ^ 0xa2f1u);
+    int lightStart = 0;
+    int lightStride = 1;
+    float lightSelectionWeight = 1.0;
+    if (totalLightCount > lightCount && lightCount > 0)
+    {
+        lightStart = min(
+            (int)floor(CacheRandom(cacheLightSeed)
+                * (float)totalLightCount),
+            totalLightCount - 1);
+        lightStride = max(totalLightCount / lightCount, 1);
+        lightSelectionWeight = min(
+            (float)totalLightCount / (float)lightCount,
+            4.0);
+    }
+
     [loop]
     for (int lightIndex = 0; lightIndex < lightCount; ++lightIndex)
     {
-        LightInfo lightInfo = inputLightsBuffer[lightIndex];
+        int selectedLightIndex =
+            totalLightCount > lightCount
+                ? (lightStart + lightIndex * lightStride)
+                    % totalLightCount
+                : lightIndex;
+        LightInfo lightInfo = inputLightsBuffer[selectedLightIndex];
         IrradianceCacheLightData lightData =
             UnpackCacheLight(lightInfo.packedData);
         float3 toLight = lightInfo.position - position;
@@ -282,13 +348,16 @@ float3 EvaluateCacheDirectIrradiance(
         float attenuation =
             GetEmissiveLightAttenuation(lightDistance)
             * PERF_EMISSIVE_CACHE_LIGHT_SCALE;
+        float lightIntensity =
+            GetLocalLightIntensityWeight(lightData.intensity);
         irradiance += shadowPayload.transmission
             * attenuation
-            * lightData.intensity
+            * lightIntensity
             * lightData.color
             * NdotL
             * PI
-            * 700.0;
+            * PERF_LOCAL_LIGHT_RADIANCE_SCALE
+            * lightSelectionWeight;
     }
 
     return ClampCachedIrradiance(irradiance);
@@ -374,10 +443,11 @@ float3 TraceCacheRadiance(RayDesc ray)
 
         float3 uncachedRadiance = EvaluateCachedOutgoingRadiance(
             hitInfo, objectInstance, (0.0).xxx);
-        return lerp(
-            uncachedRadiance,
-            cachedRadiance,
-            cacheConfidence);
+        return ClampCachedIrradiance(
+            lerp(
+                uncachedRadiance,
+                cachedRadiance,
+                cacheConfidence));
     }
 
     return GetCacheSkyRadiance(ray.Origin, ray.Direction);

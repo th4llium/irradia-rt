@@ -73,6 +73,78 @@ float3 GetDiagnosticCheckerboard(uint2 pixelCoord, float3 color)
         : (0.0).xxx;
 }
 
+void ComputePrimaryUnderwaterFog(
+    float3 rayOrigin,
+    float3 rayDirection,
+    float rayDistance,
+    out float3 outTransmittance,
+    out float3 outInscatter)
+{
+    float fogDistance =
+        rayDistance >= 65000.0
+            ? GetVolumetricFogMaxDistance()
+            : rayDistance;
+    fogDistance = min(max(fogDistance, 0.0), GetVolumetricFogMaxDistance());
+
+    float3 waterExtinction =
+        GetWaterExtinctionCoefficient(
+            max(g_view.mediaExtinction[MEDIA_TYPE_WATER].rgb, 0.0));
+    float scalarExtinction =
+        max(getLuminance(waterExtinction), 1.0e-4);
+
+    outTransmittance = exp(-waterExtinction * fogDistance);
+
+    float fogAmount =
+        1.0 - exp(-scalarExtinction * fogDistance);
+    float3 sunDir = getOffsetTrueDirectionToSun();
+    float3 moonDir = getOffsetTrueDirectionToMoon();
+    float sunFade = GetSunAmount(sunDir);
+    float moonFade = GetMoonAmount(sunDir, moonDir);
+    float isSun = step(moonFade, sunFade);
+    float3 mainLightDir = lerp(moonDir, sunDir, isSun);
+    float mainLightFade = lerp(moonFade, sunFade, isSun);
+
+    float3 sunRadiance;
+    float sunLux;
+    GetSunColorAndLux(rayOrigin, sunDir, sunRadiance, sunLux);
+    float3 moonRadiance;
+    float moonLux;
+    GetMoonColorAndLux(rayOrigin, sunDir, moonDir, moonRadiance, moonLux);
+    float3 mainRadiance = lerp(moonRadiance, sunRadiance, isSun);
+
+    float3 skyAmbient;
+    float skyLux;
+    GetSkyAmbientAndLux(
+        rayOrigin,
+        float3(0.0, 1.0, 0.0),
+        sunDir,
+        moonDir,
+        skyAmbient,
+        skyLux);
+
+    float cosTheta = dot(rayDirection, mainLightDir);
+    float g = 0.6;
+    float phaseHG =
+        (1.0 - g * g)
+        / (4.0 * PI
+            * pow(max(1.0 + g * g - 2.0 * g * cosTheta, 0.001), 1.5));
+    float uniformPhase = 1.0 / (4.0 * PI);
+    float3 waterScattering = GetWaterScatteringCoefficient();
+    float3 baseBlue = float3(0.010, 0.050, 0.080);
+    float3 sourceLight =
+        mainRadiance * mainLightFade * phaseHG * 1.35
+        + skyAmbient * uniformPhase * 2.0
+        + baseBlue;
+
+    outInscatter =
+        sourceLight
+        * waterScattering
+        * (fogAmount / scalarExtinction);
+
+    if (any(isnan(outInscatter)) || any(isinf(outInscatter)))
+        outInscatter = 0.0;
+}
+
 [numthreads(4, 8, 1)]
 void PrimaryCheckerboardRayGenInline(
     uint3 dispatchThreadID: SV_DispatchThreadID,
@@ -125,6 +197,14 @@ void PrimaryCheckerboardRayGenInline(
         pathDistance > 0.0
             ? pathDistance
             : firstHitDistance;
+    const float SKY_DISTANCE = 65000.0;
+    bool primaryHitSky =
+        primaryDepth >= SKY_DISTANCE
+        && firstHitDistance >= SKY_DISTANCE;
+    float primaryCloudDepth =
+        firstHitDistance > 0.0
+            ? firstHitDistance
+            : primaryDepth;
     float3 primaryHitPosition =
         rayDesc.Origin + rayDesc.Direction * primaryDepth;
     float3 previousPrimaryHitPosition =
@@ -136,14 +216,30 @@ void PrimaryCheckerboardRayGenInline(
         reprojectedPathLength = length(
             previousPrimaryHitPosition - g_view.previousViewOriginSteveSpace);
     }
+    if (primaryHitSky) {
+        motionVector = 0.0;
+        reprojectedPathLength = SKY_DISTANCE;
+    }
 
-    float3 transmittance;
-    float3 inscatter;
-    ComputeVolumetricFog(
-        GetPixelNdc(dispatchThreadID.xy),
-        primaryDepth,
-        transmittance,
-        inscatter);
+    float3 transmittance = 1.0;
+    float3 inscatter = 0.0;
+    if (g_view.cameraIsUnderWater != 0)
+    {
+        ComputePrimaryUnderwaterFog(
+            rayDesc.Origin,
+            rayDesc.Direction,
+            primaryDepth,
+            transmittance,
+            inscatter);
+    }
+    else if (!primaryHitSky)
+    {
+        ComputeVolumetricFog(
+            GetPixelNdc(dispatchThreadID.xy),
+            primaryDepth,
+            transmittance,
+            inscatter);
+    }
 
     diffuseIrradiance *= transmittance;
     specularRadiance *= transmittance;
@@ -151,7 +247,11 @@ void PrimaryCheckerboardRayGenInline(
 
     float cloudTransmittance = 1.0;
     float3 cloudInscatter = 0.0;
-    if (!hitGlass && !g_view.cameraIsUnderWater) {
+    if (primaryHitSky
+        && primaryCloudDepth >= SKY_DISTANCE
+        && !hitGlass
+        && !g_view.cameraIsUnderWater)
+    {
         uint3 cloudNoiseCoord = uint3(
             dispatchThreadID.xy % uint2(256, 256),
             0);
@@ -160,7 +260,7 @@ void PrimaryCheckerboardRayGenInline(
         ComputeDirectVolumetricClouds(
             rayDesc.Origin,
             rayDesc.Direction,
-            primaryDepth,
+            primaryCloudDepth,
             cloudDither,
             cloudTransmittance,
             cloudInscatter);
@@ -190,11 +290,16 @@ void PrimaryCheckerboardRayGenInline(
         albedo = GetDiagnosticCheckerboard(dispatchThreadID.xy, float3(1, 0, 1));
     }
 
-    const float maxLuminance = 4096.0;
+    float farFireflyClamp =
+        smoothstep(96.0, 384.0, primaryDepth);
+    float maxDiffuseLuminance =
+        lerp(256.0, 64.0, farFireflyClamp);
+    float maxSpecularLuminance =
+        lerp(512.0, 96.0, farFireflyClamp);
     diffuseIrradiance =
-        ClampIndirectRadiance(diffuseIrradiance, maxLuminance);
+        ClampIndirectRadiance(diffuseIrradiance, maxDiffuseLuminance);
     specularRadiance =
-        ClampIndirectRadiance(specularRadiance, maxLuminance);
+        ClampIndirectRadiance(specularRadiance, maxSpecularLuminance);
 
     outputBufferIndirectDiffuse[dispatchThreadID.xy] = float4(diffuseIrradiance, 1.0);
     outputBufferIndirectSpecular[dispatchThreadID.xy] = float4(specularRadiance, 1.0);

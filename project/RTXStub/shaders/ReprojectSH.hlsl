@@ -134,7 +134,14 @@ void ReprojectSH(
         prevSpecularMoments *= recipTotalWeight;
 
 
-        historyLength = min(historyLength, 16.0);
+        historyLength = min(
+            historyLength,
+            PERF_DIFFUSE_TEMPORAL_MAX_HISTORY);
+        prevDiffuse = ClipDiffuseHistory(
+            int2(pixelPos),
+            prevDiffuse,
+            currentDepth,
+            currentNormal);
         int2 roughnessPixel = clamp(
             int2(round(previousPixelPos - 0.5)),
             int2(0, 0),
@@ -164,12 +171,12 @@ void ReprojectSH(
         disoccludedThisFrame = true;
     }
 
-
-
-    float diffuseAlpha = max(1.0 / historyLength, 0.1);
+    float diffuseAlpha = max(
+        1.0 / max(historyLength, 1.0),
+        PERF_DIFFUSE_TEMPORAL_MIN_ALPHA);
     float3 blendedDiffuse = lerp(prevDiffuse, currentDiffuse.rgb, diffuseAlpha);
 
-    float diffuseLum = getLuminance(currentDiffuse.rgb);
+    float diffuseLum = getLuminance(max(currentDiffuse.rgb, (0.0).xxx));
     float2 diffuseMoments;
     diffuseMoments.x = diffuseLum;
     diffuseMoments.y = diffuseLum * diffuseLum;
@@ -179,9 +186,7 @@ void ReprojectSH(
     if (disoccludedThisFrame) {
         diffuseVariance += 1000000.0;
     } else if (historyLength < 4.0) {
-        float additionalVariance = exp2((1.0 / historyLength) * 12.0 + 1.0);
-        additionalVariance -= exp2((1.0 / 5.0) * 12.0 + 1.0);
-        diffuseVariance += max(additionalVariance, 0.0);
+        diffuseVariance += 0.5 * (4.0 - historyLength);
     }
 
     float minimumSpecularAlpha = lerp(0.28, 0.12, currentRoughness);
@@ -193,7 +198,7 @@ void ReprojectSH(
         currentSpecular.rgb,
         specularAlpha);
 
-    float specLum = getLuminance(currentSpecular.rgb);
+    float specLum = getLuminance(max(currentSpecular.rgb, (0.0).xxx));
     float2 specularMoments;
     specularMoments.x = specLum;
     specularMoments.y = specLum * specLum;

@@ -354,8 +354,9 @@ void RenderRayDenoised(
                         rayState.rayDesc.Direction);
                 rayState.color = colorBefore + skyContribution;
             }
-            if (rayState.foundPrimarySurface
-                || rayState.primaryDielectricSurfaceSeen)
+            bool useCloudySecondarySky =
+                rayState.primaryDielectricSurfaceSeen;
+            if (useCloudySecondarySky)
             {
                 float cloudTransmittance;
                 float3 cloudInscatter;

@@ -2,11 +2,15 @@
 #include "Include/DenoisingCommon.hlsl"
 
 #ifndef IRRADIANCE_CACHE_RECONSTRUCTION_RADIUS
-#define IRRADIANCE_CACHE_RECONSTRUCTION_RADIUS 2
+#define IRRADIANCE_CACHE_RECONSTRUCTION_RADIUS 1
 #endif
 
 #ifndef IRRADIANCE_CACHE_RECONSTRUCTION_FAR_STEP
 #define IRRADIANCE_CACHE_RECONSTRUCTION_FAR_STEP 4
+#endif
+
+#ifndef IRRADIANCE_CACHE_RECONSTRUCTION_SCALE_COUNT
+#define IRRADIANCE_CACHE_RECONSTRUCTION_SCALE_COUNT PERF_IRRADIANCE_CACHE_RECONSTRUCTION_SCALE_COUNT
 #endif
 
 #ifndef IRRADIANCE_CACHE_RECONSTRUCTION_STRENGTH
@@ -152,11 +156,42 @@ float3 TraceHighResolutionGI(
 #endif
 }
 
+float3 ClampHighResolutionGIDetail(
+    float3 detailRadiance,
+    float3 coarseRadiance,
+    float3 primaryCacheRadiance,
+    float centerConfidence)
+{
+    detailRadiance = ClampCachedIrradiance(detailRadiance);
+
+    float localSupport = max(
+        getLuminance(max(coarseRadiance, 0.0)),
+        getLuminance(max(primaryCacheRadiance, 0.0)));
+    float confidence = smoothstep(0.05, 0.65, centerConfidence);
+    float supportedMaxLuminance = max(
+        localSupport * PERF_HIGH_RES_GI_FIREFLY_SUPPORT_SCALE
+            + PERF_HIGH_RES_GI_FIREFLY_BIAS,
+        PERF_HIGH_RES_GI_FIREFLY_BIAS);
+    float maxDetailLuminance = lerp(
+        supportedMaxLuminance,
+        PERF_HIGH_RES_GI_FIREFLY_MAX_LUMINANCE,
+        confidence);
+
+    float detailLuminance = getLuminance(max(detailRadiance, 0.0));
+    if (detailLuminance > maxDetailLuminance)
+    {
+        detailRadiance *=
+            maxDetailLuminance / max(detailLuminance, 1.0e-4);
+    }
+
+    return detailRadiance;
+}
+
 [numthreads(4, 8, 1)]
 void DiffuseRayGenCombinedInline(
     uint3 dispatchThreadID : SV_DispatchThreadID,
     uint3 groupThreadID : SV_GroupThreadID,
-    uint groupIndex : SV_GroupIndex, 
+    uint groupIndex : SV_GroupIndex,
     uint3 groupID : SV_GroupID
     )
 {
@@ -184,7 +219,9 @@ void DiffuseRayGenCombinedInline(
     int2 renderSize = int2(g_view.renderResolution);
 
     [unroll]
-    for (uint scaleIndex = 0; scaleIndex < 2; ++scaleIndex)
+    for (uint scaleIndex = 0;
+        scaleIndex < IRRADIANCE_CACHE_RECONSTRUCTION_SCALE_COUNT;
+        ++scaleIndex)
     {
         int sampleStep = scaleIndex == 0
             ? 1
@@ -284,6 +321,11 @@ void DiffuseRayGenCombinedInline(
             centerPosition,
             centerNormal,
             centerDepth);
+        detailRadiance = ClampHighResolutionGIDetail(
+            detailRadiance,
+            coarseRadiance,
+            primaryCacheRadiance,
+            centerCache.a);
         float confidenceWeight =
             smoothstep(0.0, 0.35, centerCache.a);
         detailWeight = saturate(

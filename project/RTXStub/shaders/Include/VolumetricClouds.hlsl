@@ -2,13 +2,14 @@
 #define __VOLUMETRIC_CLOUDS_HLSL__
 
 #include "Sky.hlsl"
+#include "CloudWorldPosition.hlsl"
 
 #ifndef ENABLE_VOLUMETRIC_CLOUDS
 #define ENABLE_VOLUMETRIC_CLOUDS 1
 #endif
 
 #ifndef VOLUMETRIC_CLOUD_LIGHT_STEPS
-#define VOLUMETRIC_CLOUD_LIGHT_STEPS 4
+#define VOLUMETRIC_CLOUD_LIGHT_STEPS 8
 #endif
 
 #ifndef VOLUMETRIC_CLOUD_STEPS
@@ -16,7 +17,7 @@
 #endif
 
 #ifndef VOLUMETRIC_CLOUD_SHADOW_STEPS
-#define VOLUMETRIC_CLOUD_SHADOW_STEPS 5
+#define VOLUMETRIC_CLOUD_SHADOW_STEPS 8
 #endif
 
 #ifndef VOLUMETRIC_CLOUD_BASE_HEIGHT
@@ -60,19 +61,19 @@
 #endif
 
 #ifndef VOLUMETRIC_CLOUD_MAX_RENDER_DISTANCE
-#define VOLUMETRIC_CLOUD_MAX_RENDER_DISTANCE 3500.0
+#define VOLUMETRIC_CLOUD_MAX_RENDER_DISTANCE 2500.0
 #endif
 
 #ifndef VOLUMETRIC_CLOUD_FADE_DISTANCE
-#define VOLUMETRIC_CLOUD_FADE_DISTANCE 3000.0
+#define VOLUMETRIC_CLOUD_FADE_DISTANCE 2000.0
 #endif
 
 #ifndef VOLUMETRIC_CLOUD_TERRAIN_SHADOW_STRENGTH
-#define VOLUMETRIC_CLOUD_TERRAIN_SHADOW_STRENGTH 0.85
+#define VOLUMETRIC_CLOUD_TERRAIN_SHADOW_STRENGTH 1.15
 #endif
 
 #ifndef VOLUMETRIC_CLOUD_MAX_SHADOW_DISTANCE
-#define VOLUMETRIC_CLOUD_MAX_SHADOW_DISTANCE 3500.0
+#define VOLUMETRIC_CLOUD_MAX_SHADOW_DISTANCE 2500.0
 #endif
 
 #ifndef VOLUMETRIC_CLOUD_SHADOW_OD_CUTOFF
@@ -126,6 +127,11 @@ float CloudShape(float coverageNoise, float height01)
         coverageNoise
         - anvil * (shapeParams.x * shapeParams.y)
         - verticalFalloff);
+}
+
+float3 GetVolumetricCloudPatternPosition(float3 worldPosition)
+{
+    return worldPosition;
 }
 
 float GetVolumetricCloudHeight01(float y)
@@ -252,7 +258,7 @@ float3 EvaluateCloudTopScattering(float3 sunDirection)
         * skyAmount;
 }
 
-float GetVolumetricCloudDensity(float3 position)
+float GetVolumetricCloudDensityWorld(float3 position)
 {
 #if ENABLE_VOLUMETRIC_CLOUDS
     float cloudHeight = GetVolumetricCloudCurvedHeight(position);
@@ -270,8 +276,11 @@ float GetVolumetricCloudDensity(float3 position)
     float2 spiralWarp = float2(sin(twist), cos(twist)) * 8.0;
     float2 baseOffset = float2(4.0, 8.0);
 
+    float3 patternPosition =
+        GetVolumetricCloudPatternPosition(position);
+
     float baseNoise = CloudNoise2D(
-        (position.xz + spiralWarp) * scale
+        (patternPosition.xz + spiralWarp) * scale
         + baseOffset
         + float2(-0.2, 0.3) * time);
     float density = CloudShape(
@@ -283,10 +292,10 @@ float GetVolumetricCloudDensity(float3 position)
 
     float2 detailWarp = float2(cos(twist * 2.5), sin(twist * 2.5)) * 16.0;
     float detailA = CloudNoise2D(
-        (position.xz - detailWarp) * scale * 8.0
+        (patternPosition.xz - detailWarp) * scale * 8.0
         - float2(0.2, 0.0) * time);
     float detailB = CloudNoise2D(
-        (position.xz + detailWarp) * scale * 40.0
+        (patternPosition.xz + detailWarp) * scale * 40.0
         + float2(1.0, 0.0) * time);
 
     density = CloudRemap01(
@@ -305,7 +314,13 @@ float GetVolumetricCloudDensity(float3 position)
 #endif
 }
 
-bool GetVolumetricCloudLayerInterval(
+float GetVolumetricCloudDensity(float3 position)
+{
+    return GetVolumetricCloudDensityWorld(
+        GetCloudStableWorldPosition(position));
+}
+
+bool GetVolumetricCloudLayerIntervalWorld(
     float3 origin,
     float3 direction,
     out float startDist,
@@ -350,7 +365,20 @@ bool GetVolumetricCloudLayerInterval(
     return endDist > startDist;
 }
 
-float GetVolumetricCloudOpticalDepth(
+bool GetVolumetricCloudLayerInterval(
+    float3 origin,
+    float3 direction,
+    out float startDist,
+    out float endDist)
+{
+    return GetVolumetricCloudLayerIntervalWorld(
+        GetCloudStableWorldPosition(origin),
+        direction,
+        startDist,
+        endDist);
+}
+
+float GetVolumetricCloudOpticalDepthWorld(
     float3 origin,
     float3 direction,
     int stepCount,
@@ -359,7 +387,7 @@ float GetVolumetricCloudOpticalDepth(
 #if ENABLE_VOLUMETRIC_CLOUDS
     float startDist;
     float endDist;
-    if (!GetVolumetricCloudLayerInterval(
+    if (!GetVolumetricCloudLayerIntervalWorld(
         origin,
         direction,
         startDist,
@@ -385,7 +413,7 @@ float GetVolumetricCloudOpticalDepth(
     for (int i = 0; i < clampedStepCount; ++i) {
         float rayT = startDist + ((float)i + dither) * stepLength;
         float3 samplePosition = origin + direction * rayT;
-        densitySum += GetVolumetricCloudDensity(samplePosition);
+        densitySum += GetVolumetricCloudDensityWorld(samplePosition);
         if (densitySum >= densitySumCutoff)
             return VOLUMETRIC_CLOUD_SHADOW_OD_CUTOFF;
     }
@@ -396,6 +424,19 @@ float GetVolumetricCloudOpticalDepth(
 #else
     return 0.0;
 #endif
+}
+
+float GetVolumetricCloudOpticalDepth(
+    float3 origin,
+    float3 direction,
+    int stepCount,
+    float dither)
+{
+    return GetVolumetricCloudOpticalDepthWorld(
+        GetCloudStableWorldPosition(origin),
+        direction,
+        stepCount,
+        dither);
 }
 
 float GetVolumetricCloudShadowTransmission(
@@ -545,7 +586,7 @@ float3 GetCloudSingleLightScattering(
     }
 
     float cosTheta = dot(viewDirection, lightDirection);
-    float opticalDepth = GetVolumetricCloudOpticalDepth(
+    float opticalDepth = GetVolumetricCloudOpticalDepthWorld(
         position,
         lightDirection,
         VOLUMETRIC_CLOUD_LIGHT_STEPS,
@@ -576,10 +617,12 @@ void ComputeDirectVolumetricClouds(
     outInscatter = 0.0;
 
 #if ENABLE_VOLUMETRIC_CLOUDS
+    float3 worldOrigin = GetCloudStableWorldPosition(origin);
+
     float startDist;
     float endDist;
-    if (!GetVolumetricCloudLayerInterval(
-        origin,
+    if (!GetVolumetricCloudLayerIntervalWorld(
+        worldOrigin,
         viewDirection,
         startDist,
         endDist))
@@ -600,7 +643,7 @@ void ComputeDirectVolumetricClouds(
     float stepLength = marchDistance / (float)VOLUMETRIC_CLOUD_STEPS;
     float3 stepVector = viewDirection * stepLength;
     float3 cloudPosition =
-        origin + viewDirection * startDist + stepVector * dither;
+        worldOrigin + viewDirection * startDist + stepVector * dither;
 
     float3 sunDirection = getOffsetTrueDirectionToSun();
     float3 moonDirection = getOffsetTrueDirectionToMoon();
@@ -639,7 +682,7 @@ void ComputeDirectVolumetricClouds(
             currentDist);
 
         float density =
-            GetVolumetricCloudDensity(cloudPosition) * distanceFade;
+            GetVolumetricCloudDensityWorld(cloudPosition) * distanceFade;
         float opticalDepth =
             density * stepLength * VOLUMETRIC_CLOUD_EXTINCTION;
         if (opticalDepth <= 1.0e-6)
@@ -659,7 +702,7 @@ void ComputeDirectVolumetricClouds(
 
         float3 stepScattering = 0.0;
         if (sunAmount > 0.001) {
-            float lightOpticalDepth = GetVolumetricCloudOpticalDepth(
+            float lightOpticalDepth = GetVolumetricCloudOpticalDepthWorld(
                 cloudPosition,
                 sunDirection,
                 VOLUMETRIC_CLOUD_LIGHT_STEPS,
@@ -678,7 +721,7 @@ void ComputeDirectVolumetricClouds(
         }
 
         if (moonAmount > 0.001) {
-            float lightOpticalDepth = GetVolumetricCloudOpticalDepth(
+            float lightOpticalDepth = GetVolumetricCloudOpticalDepthWorld(
                 cloudPosition,
                 moonDirection,
                 VOLUMETRIC_CLOUD_LIGHT_STEPS,
@@ -728,7 +771,8 @@ VolumetricCloudSample EvaluateVolumetricCloudFroxel(
     result.extinction = 0.0;
 
 #if ENABLE_VOLUMETRIC_CLOUDS
-    float density = GetVolumetricCloudDensity(position);
+    float3 worldPosition = GetCloudStableWorldPosition(position);
+    float density = GetVolumetricCloudDensityWorld(worldPosition);
     if (density <= 0.00001)
         return result;
 
@@ -737,7 +781,7 @@ VolumetricCloudSample EvaluateVolumetricCloudFroxel(
 
     float3 sourceRadiance = 0.0;
     sourceRadiance += GetCloudSingleLightScattering(
-        position,
+        worldPosition,
         density,
         viewDirection,
         sunDirection,
@@ -746,7 +790,7 @@ VolumetricCloudSample EvaluateVolumetricCloudFroxel(
         VOLUMETRIC_CLOUD_SUN_INTENSITY,
         dither);
     sourceRadiance += GetCloudSingleLightScattering(
-        position,
+        worldPosition,
         density,
         viewDirection,
         moonDirection,
@@ -755,7 +799,9 @@ VolumetricCloudSample EvaluateVolumetricCloudFroxel(
         VOLUMETRIC_CLOUD_MOON_INTENSITY,
         dither);
 
-    float height01 = GetVolumetricCloudHeight01(position.y);
+    float height01 =
+        GetVolumetricCloudHeight01(
+            GetVolumetricCloudCurvedHeight(worldPosition));
     float ambientWrap = lerp(0.20, 0.65, height01);
     sourceRadiance += skyAmbientRadiance
         * ambientWrap
