@@ -5,15 +5,15 @@
 #include "Util.hlsl"
 
 #ifndef WATER_ABSORPTION_SCALE
-#define WATER_ABSORPTION_SCALE 0.045
+#define WATER_ABSORPTION_SCALE 0.18
 #endif
 
 #ifndef WATER_SCATTERING_SCALE
-#define WATER_SCATTERING_SCALE 0.032
+#define WATER_SCATTERING_SCALE 0.05
 #endif
 
-static const float3 WATER_ABSORPTION_TINT = float3(1.0, 0.32, 0.075);
-static const float3 WATER_SCATTERING_TINT = float3(0.035, 0.36, 1.0);
+static const float3 WATER_ABSORPTION_TINT = float3(1.0, 0.45, 0.05);
+static const float3 WATER_SCATTERING_TINT = float3(0.02, 0.25, 1.0);
 
 float3 GetWaterExtinctionCoefficient()
 {
@@ -109,11 +109,39 @@ float get_water_height(float2 p, float time)
 #endif
 
 #ifndef WATER_CAUSTICS_MAX_PROJECTED_DEPTH
-#define WATER_CAUSTICS_MAX_PROJECTED_DEPTH 96.0
+#define WATER_CAUSTICS_MAX_PROJECTED_DEPTH 16.0
 #endif
 
 #ifndef WATER_CAUSTICS_SURFACE_BIAS
 #define WATER_CAUSTICS_SURFACE_BIAS 0.04
+#endif
+
+#ifndef WATER_CAUSTICS_PROJECTED_MAX_VERTICAL_DISTANCE
+#define WATER_CAUSTICS_PROJECTED_MAX_VERTICAL_DISTANCE 10.0
+#endif
+
+#ifndef WATER_CAUSTICS_WALL_BOUNCE_STRENGTH
+#define WATER_CAUSTICS_WALL_BOUNCE_STRENGTH 0.55
+#endif
+
+#ifndef WATER_CAUSTICS_WALL_BOUNCE_MAX_DISTANCE
+#define WATER_CAUSTICS_WALL_BOUNCE_MAX_DISTANCE 68.0
+#endif
+
+#ifndef WATER_CAUSTICS_WALL_BOUNCE_HALF_HEIGHT
+#define WATER_CAUSTICS_WALL_BOUNCE_HALF_HEIGHT 8.0
+#endif
+
+#ifndef WATER_PARALLAX_SPEED_MULTIPLIER
+#define WATER_PARALLAX_SPEED_MULTIPLIER WATER_CAUSTICS_SPEED
+#endif
+
+#ifndef WATER_PARALLAX_FREQUENCY
+#define WATER_PARALLAX_FREQUENCY 0.055
+#endif
+
+#ifndef WATER_PARALLAX_AMPLITUDE
+#define WATER_PARALLAX_AMPLITUDE 0.65
 #endif
 
 float4 WaterCausticMod289(float4 x)
@@ -186,6 +214,51 @@ float4 WaterCausticSimplex(float3 v)
     return 42.0 * float4(grad, dot(m4, px));
 }
 
+float WaterCausticNoise3(float3 p)
+{
+    return saturate(0.5 + 0.5 * WaterCausticSimplex(p).w);
+}
+
+float GetWaterParallaxCausticDisplacement(float3 stepPos)
+{
+    float dist = length(stepPos - g_view.viewOriginSteveSpace);
+    stepPos -= g_view.waveWorksOriginInSteveSpace;
+    stepPos.z *= 2.0;
+
+    float t = frac(g_view.time * WATER_PARALLAX_SPEED_MULTIPLIER / 256.0) * 256.0;
+    float n = WaterCausticNoise3(
+        float3(
+            stepPos.xz * WATER_PARALLAX_FREQUENCY + float2(t, t),
+            t * 0.75));
+
+    if (dist < WATER_CAUSTICS_WALL_BOUNCE_MAX_DISTANCE)
+    {
+        float n2 = WaterCausticNoise3(
+            float3(
+                stepPos.xz * WATER_PARALLAX_FREQUENCY * 2.0 + float2(t, t),
+                t * 0.75)) * 0.5;
+        n = lerp(
+            n + n2,
+            n,
+            smoothstep(
+                WATER_CAUSTICS_WALL_BOUNCE_MAX_DISTANCE - 8.0,
+                WATER_CAUSTICS_WALL_BOUNCE_MAX_DISTANCE,
+                dist));
+    }
+
+    float closeDistance = WATER_CAUSTICS_WALL_BOUNCE_MAX_DISTANCE * 0.5;
+    if (dist < closeDistance)
+    {
+        float n2 = WaterCausticNoise3(
+            float3(
+                stepPos.xz * WATER_PARALLAX_FREQUENCY * 4.0 + float2(t, t),
+                t * 0.75)) * 0.25;
+        n = lerp(n + n2, n, smoothstep(closeDistance - 4.0, closeDistance, dist));
+    }
+
+    return (2.0 * n * (4.0 / 7.0) - 1.0) * WATER_PARALLAX_AMPLITUDE;
+}
+
 float CalcProceduralWaterCaustics(float3 waterHitPosition, float receiverToWaterDistance)
 {
     float3 pos = float3(
@@ -207,14 +280,6 @@ float CalcProceduralWaterCaustics(float3 waterHitPosition, float receiverToWater
     return lerp(1.0, caustics, distanceFade);
 }
 
-float3 CalcWaterCausticTransmission(float3 waterHitPosition, float receiverToWaterDistance)
-{
-    float caustics = CalcProceduralWaterCaustics(waterHitPosition, receiverToWaterDistance);
-    float3 waterExtinction = GetWaterExtinctionCoefficient();
-    float3 waterTransmittance = exp(-waterExtinction * max(receiverToWaterDistance, 0.0));
-    return waterTransmittance * caustics;
-}
-
 float3 GetWaterCausticPatternPosition(float3 waterSurfacePosition)
 {
     float3 patternPosition =
@@ -223,32 +288,12 @@ float3 GetWaterCausticPatternPosition(float3 waterSurfacePosition)
         - floor(patternPosition / 1024.0) * 1024.0;
 }
 
-bool TryGetProjectedWaterCausticTransmission(
-    float3 receiverPosition,
-    float3 lightDirection,
-    out float3 transmission)
+float3 CalcWaterCausticTransmission(float3 waterHitPosition, float receiverToWaterDistance)
 {
-    transmission = 1.0;
-
-    if (lightDirection.y <= 0.02)
-        return false;
-
-    float receiverToWaterDistance =
-        (g_view.waveWorksOriginInSteveSpace.y - receiverPosition.y)
-        / lightDirection.y;
-    if (receiverToWaterDistance <= WATER_CAUSTICS_SURFACE_BIAS
-        || receiverToWaterDistance > WATER_CAUSTICS_MAX_PROJECTED_DEPTH)
-    {
-        return false;
-    }
-
-    float3 waterSurfacePosition =
-        receiverPosition + lightDirection * receiverToWaterDistance;
-    transmission =
-        CalcWaterCausticTransmission(
-            GetWaterCausticPatternPosition(waterSurfacePosition),
-            receiverToWaterDistance);
-    return true;
+    float caustics = CalcProceduralWaterCaustics(waterHitPosition, receiverToWaterDistance);
+    float3 waterExtinction = GetWaterExtinctionCoefficient();
+    float3 waterTransmittance = exp(-waterExtinction * max(receiverToWaterDistance, 0.0));
+    return waterTransmittance * caustics;
 }
 
 float3 GetWaterNormal(float3 p, float time, float3 geomNormal) {

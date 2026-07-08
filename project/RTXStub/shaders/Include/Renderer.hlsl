@@ -58,6 +58,12 @@ static const uint kDielectricPathSample = 0;
 static const uint kDielectricPathReflect = 1;
 static const uint kDielectricPathRefract = 2;
 
+static const uint kPrimaryMaterialSky = 0;
+static const uint kPrimaryMaterialOpaque = 1;
+static const uint kPrimaryMaterialGlass = 2;
+static const uint kPrimaryMaterialWater = 3;
+static const uint kPrimaryMaterialFullTraced = 4;
+
 struct RayState
 {
     RayDesc rayDesc;
@@ -67,11 +73,18 @@ struct RayState
 
     float3 diffuseIrradiance;
     float3 specular;
+    float3 primaryBaseColor;
     float3 primaryAlbedo;
     float3 primaryEmission;
     float3 primaryNormal;
     float primaryRoughness;
     float primaryMetalness;
+    float primaryOpacity;
+    float primarySubsurface;
+    float3 primaryWorldPosition;
+    float3 primaryViewDirection;
+    float3 primaryThroughputAtHit;
+    uint primaryMaterialClass;
     float3 primaryCachedIrradiance;
     float primaryIrradianceCacheConfidence;
 
@@ -107,11 +120,18 @@ struct RayState
         throughput = 1;
         diffuseIrradiance = 0;
         specular = 0;
+        primaryBaseColor = 0;
         primaryAlbedo = 0;
         primaryEmission = 0;
         primaryNormal = float3(0, 1, 0);
         primaryRoughness = 1.0;
         primaryMetalness = 0.0;
+        primaryOpacity = 1.0;
+        primarySubsurface = 0.0;
+        primaryWorldPosition = 0.0;
+        primaryViewDirection = float3(0, 0, 1);
+        primaryThroughputAtHit = 1.0;
+        primaryMaterialClass = kPrimaryMaterialSky;
         primaryCachedIrradiance = 0.0;
         primaryIrradianceCacheConfidence = 0.0;
         distance = 0;
@@ -258,10 +278,18 @@ void RenderRayDenoised(
     out float3 outputMotion,
     out float3 outDiffuseIrradiance,
     out float3 outSpecular,
+    out float3 outBaseColor,
     out float3 outAlbedo,
     out float3 outEmission,
     out float3 outNormal,
     out float outRoughness,
+    out float outMetalness,
+    out float outOpacity,
+    out float outSubsurface,
+    out float3 outPrimaryWorldPosition,
+    out float3 outPrimaryViewDirection,
+    out float3 outPrimaryThroughput,
+    out uint outPrimaryMaterialClass,
     out float4 outIncomingIrradianceCache,
     out bool outHitGlassPrimary)
 {
@@ -364,7 +392,7 @@ void RenderRayDenoised(
                     rayState.rayDesc.Origin,
                     rayState.rayDesc.Direction,
                     65504.0,
-                    GetBlueNoise1D(rayState),
+                    GetVolumetricCloudDither(rayState.pixelCoord),
                     cloudTransmittance,
                     cloudInscatter);
                 skyContribution =
@@ -374,6 +402,19 @@ void RenderRayDenoised(
             }
             
             if (!rayState.foundPrimarySurface) {
+                rayState.primaryBaseColor = 0.0;
+                rayState.primaryAlbedo = 0.0;
+                rayState.primaryNormal = float3(0.0, 1.0, 0.0);
+                rayState.primaryRoughness = 1.0;
+                rayState.primaryMetalness = 0.0;
+                rayState.primaryOpacity = 1.0;
+                rayState.primarySubsurface = 0.0;
+                rayState.primaryWorldPosition =
+                    rayState.rayDesc.Origin
+                    + rayState.rayDesc.Direction * 65504.0;
+                rayState.primaryViewDirection = rayState.rayDesc.Direction;
+                rayState.primaryThroughputAtHit = rayState.throughput;
+                rayState.primaryMaterialClass = kPrimaryMaterialSky;
                 rayState.primaryEmission += skyContribution;
                 rayState.distance = 65504.0;
                 rayState.foundPrimarySurface = true;
@@ -405,10 +446,18 @@ void RenderRayDenoised(
 
     outDiffuseIrradiance = rayState.diffuseIrradiance;
     outSpecular = rayState.specular;
+    outBaseColor = rayState.primaryBaseColor;
     outAlbedo = rayState.primaryAlbedo;
     outEmission = rayState.primaryEmission;
     outNormal = rayState.primaryNormal;
     outRoughness = rayState.primaryRoughness;
+    outMetalness = rayState.primaryMetalness;
+    outOpacity = rayState.primaryOpacity;
+    outSubsurface = rayState.primarySubsurface;
+    outPrimaryWorldPosition = rayState.primaryWorldPosition;
+    outPrimaryViewDirection = rayState.primaryViewDirection;
+    outPrimaryThroughput = rayState.primaryThroughputAtHit;
+    outPrimaryMaterialClass = rayState.primaryMaterialClass;
     outIncomingIrradianceCache = float4(
         rayState.primaryCachedIrradiance,
         rayState.primaryIrradianceCacheConfidence);
@@ -419,11 +468,19 @@ float3 RenderRay(uint2 pixelCoord, RayDesc rayDesc, uint randSeed, out float out
 {
     float3 diffuseIrradiance;
     float3 specular;
+    float3 baseColor;
     float3 albedo;
     float3 emission;
     float3 normal;
     float firstHitDistance;
     float roughness;
+    float metalness;
+    float opacity;
+    float subsurface;
+    float3 primaryWorldPosition;
+    float3 primaryViewDirection;
+    float3 primaryThroughput;
+    uint primaryMaterialClass;
     float4 cacheSample;
     bool hitGlass;
     RenderRayDenoised(
@@ -436,10 +493,18 @@ float3 RenderRay(uint2 pixelCoord, RayDesc rayDesc, uint randSeed, out float out
         outputMotion,
         diffuseIrradiance,
         specular,
+        baseColor,
         albedo,
         emission,
         normal,
         roughness,
+        metalness,
+        opacity,
+        subsurface,
+        primaryWorldPosition,
+        primaryViewDirection,
+        primaryThroughput,
+        primaryMaterialClass,
         cacheSample,
         hitGlass);
     return albedo * diffuseIrradiance + specular + emission;

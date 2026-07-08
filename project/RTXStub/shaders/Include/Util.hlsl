@@ -167,7 +167,54 @@ float2 unpackVertexUV(uint packedUV, bool packedUvIncludesBias = false) {
     }
 }
 
+#ifndef SKY_BACKGROUND_TYPE_END
+#define SKY_BACKGROUND_TYPE_END 2u
+#endif
+
+#ifndef SKY_LIGHTING_TYPE_END
+#define SKY_LIGHTING_TYPE_END 2u
+#endif
+
+#ifndef END_CELESTIAL_DIRECTION
+#define END_CELESTIAL_DIRECTION float3(-0.36, 0.86, 0.36)
+#endif
+
+float3 GetEndCelestialDirection()
+{
+    return safeNormalize(
+        END_CELESTIAL_DIRECTION,
+        float3(-0.36, 0.86, 0.36));
+}
+
+bool IsEndSky()
+{
+    float overrideLuminance =
+        getLuminance(max(g_view.finalCombineSkyColourOverride, 0.0));
+    float skyLuminance =
+        getLuminance(
+            max(g_view.skyColor, 0.0)
+            + max(g_view.skyColorUp, 0.0)
+            + max(g_view.skyColorDown, 0.0))
+        * (1.0 / 3.0);
+
+    bool explicitEndBackground =
+        g_view.skyBackgroundType == SKY_BACKGROUND_TYPE_END
+        || g_view.skyLightingType == SKY_LIGHTING_TYPE_END;
+    bool blackSkyOverride =
+        g_view.finalCombineSkyColourOverrideStrength > 0.50
+        && overrideLuminance < 0.015;
+    bool blackEngineSky =
+        g_view.skyColorBlend > 0.50
+        && g_view.skyTextureW <= 0.02
+        && skyLuminance < 0.018;
+
+    return explicitEndBackground || blackSkyOverride || blackEngineSky;
+}
+
 bool isMoonPrimaryLight() {
+    if (IsEndSky())
+        return false;
+
     if (abs(g_view.directionToSun.y) > 0.999) return g_view.skyTextureW > 0.9;
     float angle1 = g_view.sunAzimuth - PI;
     float angle2 = atan2(g_view.directionToSun.z, g_view.directionToSun.x);
@@ -176,10 +223,16 @@ bool isMoonPrimaryLight() {
 }
 
 float3 getTrueDirectionToSun() {
+    if (IsEndSky())
+        return GetEndCelestialDirection();
+
     return isMoonPrimaryLight() ? -g_view.directionToSun : g_view.directionToSun;
 }
 
 float3 getTrueDirectionToMoon() {
+    if (IsEndSky())
+        return -GetEndCelestialDirection();
+
     return isMoonPrimaryLight() ? g_view.directionToSun : -g_view.directionToSun;
 }
 
@@ -196,15 +249,127 @@ float3 offsetCelestialDirection(float3 direction) {
 }
 
 float3 getOffsetPrimaryCelestialDirection() {
+    if (IsEndSky())
+        return GetEndCelestialDirection();
+
     return offsetCelestialDirection(g_view.directionToSun);
 }
 
 float3 getOffsetTrueDirectionToSun() {
+    if (IsEndSky())
+        return GetEndCelestialDirection();
+
     return offsetCelestialDirection(getTrueDirectionToSun());
 }
 
 float3 getOffsetTrueDirectionToMoon() {
+    if (IsEndSky())
+        return -GetEndCelestialDirection();
+
     return offsetCelestialDirection(getTrueDirectionToMoon());
+}
+
+#ifndef WEATHER_RAIN_CLOUD_BASE_HEIGHT
+#define WEATHER_RAIN_CLOUD_BASE_HEIGHT 300.0
+#endif
+
+#ifndef WEATHER_RAIN_CLOUD_THICKNESS
+#define WEATHER_RAIN_CLOUD_THICKNESS 160.0
+#endif
+
+#ifndef WEATHER_RAIN_CLOUD_COVERAGE
+#define WEATHER_RAIN_CLOUD_COVERAGE 0.95
+#endif
+
+#ifndef WEATHER_RAIN_FOG_DENSITY_MULTIPLIER
+#define WEATHER_RAIN_FOG_DENSITY_MULTIPLIER 9.25
+#endif
+
+#ifndef WEATHER_RAIN_NIGHT_FOG_DENSITY_MULTIPLIER
+#define WEATHER_RAIN_NIGHT_FOG_DENSITY_MULTIPLIER 12.0
+#endif
+
+#ifndef WEATHER_RAIN_PUDDLE_SKY_TEST_DISTANCE
+#define WEATHER_RAIN_PUDDLE_SKY_TEST_DISTANCE 256.0
+#endif
+
+#ifndef WEATHER_RAIN_PUDDLE_NOISE_SCALE
+#define WEATHER_RAIN_PUDDLE_NOISE_SCALE 0.075
+#endif
+
+#ifndef WEATHER_RAIN_PUDDLE_STRENGTH
+#define WEATHER_RAIN_PUDDLE_STRENGTH 1.15
+#endif
+
+#ifndef WEATHER_RAIN_PUDDLE_REFLECTION_STRENGTH
+#define WEATHER_RAIN_PUDDLE_REFLECTION_STRENGTH 1.35
+#endif
+
+#ifndef WEATHER_RAIN_DAY_COLOR
+#define WEATHER_RAIN_DAY_COLOR float3(0.38, 0.395, 0.410)
+#endif
+
+#ifndef WEATHER_RAIN_NIGHT_COLOR
+#define WEATHER_RAIN_NIGHT_COLOR float3(0.040, 0.045, 0.052)
+#endif
+
+float GetWeatherRainAmount()
+{
+    return smoothstep(0.02, 0.85, saturate(g_view.rainLevel));
+}
+
+float GetWeatherSurfaceWetness()
+{
+    return saturate(max(g_view.surfaceWetness, g_view.rainLevel));
+}
+
+float GetWeatherRainCloudTopHeight()
+{
+    return WEATHER_RAIN_CLOUD_BASE_HEIGHT + WEATHER_RAIN_CLOUD_THICKNESS;
+}
+
+float GetWeatherUnderRainCloudAmount(float3 position)
+{
+    return 1.0 - smoothstep(
+        GetWeatherRainCloudTopHeight() - 8.0,
+        GetWeatherRainCloudTopHeight() + 64.0,
+        position.y);
+}
+
+float GetWeatherRainOnSurfaceAmount(float3 position)
+{
+    return GetWeatherRainAmount() * GetWeatherUnderRainCloudAmount(position);
+}
+
+float3 GetWeatherGreyRadiance(float3 color, float3 tint)
+{
+    return max(getLuminance(max(color, 0.0)), 0.0) * tint;
+}
+
+float3 GetWeatherRainPalette(float nightAmount)
+{
+    return lerp(
+        WEATHER_RAIN_DAY_COLOR,
+        WEATHER_RAIN_NIGHT_COLOR,
+        saturate(nightAmount));
+}
+
+float GetWeatherRainLuminanceScale(float nightAmount)
+{
+    return lerp(0.68, 0.42, saturate(nightAmount));
+}
+
+float WeatherNoise2D(float2 x)
+{
+    float2 p = floor(x);
+    float2 f = frac(x);
+    float2 u = f * f * (3.0 - 2.0 * f);
+
+    float a = hash32(p).x;
+    float b = hash32(p + float2(1.0, 0.0)).x;
+    float c = hash32(p + float2(0.0, 1.0)).x;
+    float d = hash32(p + float2(1.0, 1.0)).x;
+    return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
 }
 
 float3 sampleCelestialLightDisk(float3 lightDirection, float2 sampleValue) {

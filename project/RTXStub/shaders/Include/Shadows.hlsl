@@ -122,19 +122,18 @@ float GetShadowGlassInterfaceTransmission(
     return 1.0 - fresnel;
 }
 
+
 void TraceShadowRay(in RayDesc ray, out ShadowPayload payload)
 {
     RayQuery<
-        RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES
-        | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
+        RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> query;
     const uint instanceMask =
         INSTANCE_MASK_OPAQUE_OR_ALPHA_TEST_SECONDARY
         | INSTANCE_MASK_ALPHA_BLEND_SECONDARY
         | INSTANCE_MASK_WATER;
     query.TraceRayInline(
         SceneBVH,
-        RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES
-            | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH,
+        RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES,
         instanceMask,
         ray);
 
@@ -223,6 +222,7 @@ void TraceShadowRay(in RayDesc ray, out ShadowPayload payload)
         else if (hitInfo.materialType == MATERIAL_TYPE_WATER) {
             float3 waterHitPosition =
                 ray.Origin + ray.Direction * hitInfo.rayT;
+            
             transmission *= CalcWaterCausticTransmission(
                 GetWaterCausticPatternPosition(waterHitPosition),
                 hitInfo.rayT);
@@ -243,18 +243,7 @@ void TraceShadowRay(in RayDesc ray, out ShadowPayload payload)
     if (insideGlass)
         transmission *= exp(-glassExtinction * 0.125);
 
-    if (!hitWaterForCaustics
-        && query.CommittedStatus() == COMMITTED_NOTHING)
-    {
-        float3 projectedWaterTransmission;
-        if (TryGetProjectedWaterCausticTransmission(
-            ray.Origin,
-            ray.Direction,
-            projectedWaterTransmission))
-        {
-            transmission *= projectedWaterTransmission;
-        }
-    }
+
 
     payload.transmission =
         query.CommittedStatus() == COMMITTED_NOTHING
@@ -384,12 +373,10 @@ float3 ResolveTemporalSunShadow(
 bool TraceOcclusionRay(in RayDesc ray)
 {
     RayQuery<
-        RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES
-        | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
+        RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
     query.TraceRayInline(
         SceneBVH,
-        RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES
-            | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH,
+        RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH,
         INSTANCE_MASK_OPAQUE_OR_ALPHA_TEST_SECONDARY,
         ray);
 

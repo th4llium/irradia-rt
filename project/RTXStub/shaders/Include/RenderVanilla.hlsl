@@ -8,6 +8,10 @@
 #define WATER_FRESNEL_BOOST 1.25
 #endif
 
+#ifndef MCRTX_PRIMARY_GUIDE_ONLY
+#define MCRTX_PRIMARY_GUIDE_ONLY 0
+#endif
+
 float2 GetBlueNoise2D(inout RayState rayState) {
     uint3 noiseCoord = uint3(rayState.pixelCoord.xy % uint2(64, 32), g_view.frameCount % 8);
     float4 baseBlueNoise = blueNoiseTexture.Load(uint4(noiseCoord, 0));
@@ -23,6 +27,189 @@ float GetBlueNoise1D(inout RayState rayState) {
         frac(baseBlueNoise.z + rayState.blueNoiseSequence * 0.61803398875);
     rayState.blueNoiseSequence++;
     return sampleValue;
+}
+
+#ifndef POINT_LIGHT_MAX_COUNT
+#define POINT_LIGHT_MAX_COUNT 25
+#endif
+
+#ifndef POINT_LIGHT_SHADOW_RADIUS
+#define POINT_LIGHT_SHADOW_RADIUS 0.035
+#endif
+
+#ifndef POINT_LIGHT_SHADOW_SAMPLES
+#define POINT_LIGHT_SHADOW_SAMPLES 1
+#endif
+
+#ifndef POINT_LIGHT_BRDF_SCALE
+#define POINT_LIGHT_BRDF_SCALE 700.0
+#endif
+
+float2 GetPointLightBlueNoise(uint2 pixelCoord)
+{
+    uint3 noiseCoord = uint3(pixelCoord.xy % uint2(64, 32), g_view.frameCount % 8);
+    return blueNoiseTexture.Load(uint4(noiseCoord, 0)).xy;
+}
+
+void EvaluatePointLightBRDF(
+    float3 normal,
+    float3 V,
+    float3 lightDirection,
+    float3 F0,
+    float3 diffuseColor,
+    float roughness,
+    float subsurface,
+    out float3 diffuseBRDF,
+    out float3 specularBRDF)
+{
+    float NdotV = max(dot(normal, V), 0.0001);
+    float NdotL = max(dot(normal, lightDirection), 0.0001);
+    float3 H = safeNormalize(V + lightDirection, normal);
+    float NdotH = max(dot(normal, H), 0.0);
+    float LdotH = max(dot(lightDirection, H), 0.0);
+
+    float3 F = F_Schlick(max(dot(H, V), 0.0), F0);
+    float D = D_GGX(NdotH, roughness);
+    float G = G_Smith(NdotV, NdotL, roughness);
+    float3 multipleScatter =
+        FdezAgueraMultipleScattering(NdotV, NdotL, roughness, F0);
+    specularBRDF =
+        ((F * D * G) / (4.0 * max(NdotV * NdotL, 0.001)))
+        + multipleScatter;
+
+    diffuseBRDF = DisneyDiffuse(
+        NdotL, NdotV, LdotH, roughness, diffuseColor);
+    if (subsurface > 0.001) {
+        diffuseBRDF = lerp(
+            diffuseBRDF,
+            BurleyNormalizedSSS(
+                NdotL, NdotV, LdotH, roughness, diffuseColor),
+            subsurface);
+    }
+    diffuseBRDF *= DiffuseEnergyWeight(F, multipleScatter);
+}
+
+float3 TracePointLightDiskShadow(
+    float3 position,
+    float3 normal,
+    float3 lightDirection,
+    float lightDistance,
+    float2 blueNoise,
+    int lightIndex)
+{
+    float3 T = safeNormalize(
+        cross(
+            abs(lightDirection.z) < 0.999
+                ? float3(0, 0, 1)
+                : float3(1, 0, 0),
+            lightDirection),
+        float3(1, 0, 0));
+    float3 B = cross(lightDirection, T);
+    float3 shadowTransmission = 0.0;
+
+    [loop]
+    for (int sampleIndex = 0; sampleIndex < POINT_LIGHT_SHADOW_SAMPLES; sampleIndex++) {
+        float sampleSeed = (float)(
+            sampleIndex + lightIndex * POINT_LIGHT_SHADOW_SAMPLES);
+        float2 Xi = frac(
+            blueNoise
+            + float2(
+                sampleSeed * 0.61803398875,
+                sampleSeed * 0.38196601125));
+
+        float r = POINT_LIGHT_SHADOW_RADIUS * sqrt(Xi.x);
+        float theta = 2.0 * PI * Xi.y;
+        float2 disk = r * float2(cos(theta), sin(theta));
+        float3 sampleDirection = safeNormalize(
+            lightDirection + disk.x * T + disk.y * B,
+            lightDirection);
+
+        RayDesc shadowRay;
+        shadowRay.Origin = position + 1.0e-4 * normal;
+        shadowRay.Direction = sampleDirection;
+        shadowRay.TMin = 0.0;
+        shadowRay.TMax = max(lightDistance - 0.55, 0.0);
+
+        if (shadowRay.TMax <= 0.0) {
+            shadowTransmission += 1.0;
+        } else {
+            ShadowPayload payload;
+            TraceShadowRay(shadowRay, payload);
+            shadowTransmission += payload.transmission;
+        }
+    }
+
+    return shadowTransmission / (float)POINT_LIGHT_SHADOW_SAMPLES;
+}
+
+void AccumulateShadowedPointLights(
+    float3 position,
+    float3 normal,
+    float3 V,
+    float3 F0,
+    float3 diffuseColor,
+    float roughness,
+    float subsurface,
+    float2 blueNoise,
+    out float3 directDiffuse,
+    out float3 directSpecular)
+{
+    directDiffuse = 0.0;
+    directSpecular = 0.0;
+
+    int lightCount = min(POINT_LIGHT_MAX_COUNT, (int)g_view.cpuLightsCount);
+
+    [loop]
+    for (int lightIndex = 0; lightIndex < lightCount; lightIndex++) {
+        LightInfo lightInfo = inputLightsBuffer[lightIndex];
+        LightData lightData = UnpackLight(lightInfo.packedData);
+
+        float3 toLight = lightInfo.position - position;
+        float lightDistance = length(toLight);
+        if (lightDistance <= 0.001)
+            continue;
+
+        float3 lightDirection = toLight / lightDistance;
+        float NdotL = max(dot(normal, lightDirection), 0.0);
+        if (NdotL <= 0.0)
+            continue;
+
+        float attenuation =
+            NdotL / max(lightDistance * lightDistance, 1.0e-4);
+        float3 shadowTransmission =
+            TracePointLightDiskShadow(
+                position,
+                normal,
+                lightDirection,
+                lightDistance,
+                blueNoise,
+                lightIndex);
+        float3 lightColor =
+            lightData.intensity
+            * lightData.color
+            * shadowTransmission;
+
+        if (!any(lightColor > 0.0))
+            continue;
+
+        float3 diffuseBRDF;
+        float3 specularBRDF;
+        EvaluatePointLightBRDF(
+            normal,
+            V,
+            lightDirection,
+            F0,
+            diffuseColor,
+            roughness,
+            subsurface,
+            diffuseBRDF,
+            specularBRDF);
+
+        float3 lightContrib =
+            lightColor * attenuation * POINT_LIGHT_BRDF_SCALE;
+        directDiffuse += lightContrib * diffuseBRDF;
+        directSpecular += lightContrib * specularBRDF;
+    }
 }
 
 int GetStableLocalLightCandidateIndex(
@@ -266,6 +453,122 @@ float3 TraceDielectricReflectionProbe(
     return environment;
 }
 
+float2 GetRainPuddleDiskOffset(float2 sampleValue)
+{
+    float radius = sqrt(saturate(sampleValue.x));
+    float angle = sampleValue.y * 2.0 * PI;
+    return float2(cos(angle), sin(angle)) * radius;
+}
+
+bool IsRainPuddleSkyVisible(
+    float3 position,
+    float3 normal,
+    float2 sampleValue)
+{
+    float3 tangentReference =
+        abs(normal.y) < 0.999
+            ? float3(0.0, 1.0, 0.0)
+            : float3(1.0, 0.0, 0.0);
+    float3 tangent = safeNormalize(
+        cross(tangentReference, normal),
+        float3(1.0, 0.0, 0.0));
+    float3 bitangent = cross(normal, tangent);
+    float2 diskOffset = GetRainPuddleDiskOffset(sampleValue) * 0.42;
+
+    RayDesc skyRay;
+    skyRay.Origin =
+        position
+        + normal * 0.080
+        + tangent * diskOffset.x
+        + bitangent * diskOffset.y;
+    skyRay.Direction =
+        safeNormalize(
+            float3(
+                (sampleValue.x - 0.5) * 0.22,
+                1.0,
+                (sampleValue.y - 0.5) * 0.22),
+            float3(0.0, 1.0, 0.0));
+    skyRay.TMin = 0.050;
+    skyRay.TMax = WEATHER_RAIN_PUDDLE_SKY_TEST_DISTANCE;
+
+    RayQuery<
+        RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES
+        | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
+    query.TraceRayInline(
+        SceneBVH,
+        RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES
+            | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH,
+        INSTANCE_MASK_OPAQUE_OR_ALPHA_TEST_SECONDARY
+            | INSTANCE_MASK_ALPHA_BLEND_SECONDARY,
+        skyRay);
+
+    while (query.Proceed())
+    {
+        HitInfo hitInfo;
+        hitInfo.rayT = query.CandidateTriangleRayT();
+        hitInfo.frontFacing = query.CandidateTriangleFrontFace();
+        hitInfo.barycentric2 = query.CandidateTriangleBarycentrics();
+        hitInfo.materialType = query.CandidateInstanceID();
+        hitInfo.objectInstanceIndex = query.CandidateInstanceIndex();
+        hitInfo.primitiveId = query.CandidatePrimitiveIndex();
+
+        ObjectInstance object =
+            objectInstances[hitInfo.objectInstanceIndex];
+        bool isCloud =
+            (object.flags & kObjectInstanceFlagClouds)
+            || ((object.offsetPack5 >> 8) == MEDIA_TYPE_CLOUD);
+        if (isCloud)
+            continue;
+
+        if (hitInfo.materialType == MATERIAL_TYPE_ALPHA_TEST
+            && !AlphaTestHitLogic(hitInfo))
+        {
+            continue;
+        }
+
+        query.CommitNonOpaqueTriangleHit();
+    }
+
+    return query.CommittedStatus() == COMMITTED_NOTHING;
+}
+
+float GetRainPuddleAmount(
+    float3 position,
+    float3 normal,
+    float2 skySampleValue)
+{
+    float wetness = GetWeatherSurfaceWetness();
+    float rainAmount = GetWeatherRainAmount();
+    if (wetness <= 0.001 || rainAmount <= 0.001)
+        return 0.0;
+
+    float topSurface = smoothstep(0.58, 0.92, normal.y);
+    if (topSurface <= 0.0)
+        return 0.0;
+
+    float3 stablePosition = GetCloudStableWorldPosition(position);
+    float2 puddleCoord = stablePosition.xz * WEATHER_RAIN_PUDDLE_NOISE_SCALE;
+    float broadNoise = WeatherNoise2D(puddleCoord);
+    float detailNoise =
+        WeatherNoise2D(puddleCoord * 3.7 + float2(17.1, 43.7));
+    float puddleNoise =
+        smoothstep(
+            0.30,
+            0.67,
+            broadNoise * 0.72 + detailNoise * 0.28 + wetness * 0.22);
+
+    bool skyVisible =
+        IsRainPuddleSkyVisible(position, normal, skySampleValue);
+
+    return saturate(
+        (skyVisible ? 1.0 : 0.0)
+        * topSurface
+        * puddleNoise
+        * wetness
+        * rainAmount
+        * WEATHER_RAIN_PUDDLE_STRENGTH);
+}
+
 float3 GetSurfaceMediumExtinction(
     uint mediumType,
     float3 color,
@@ -281,6 +584,44 @@ float3 GetSurfaceMediumExtinction(
         return GetWaterExtinctionCoefficient(engineExtinction);
     }
     return engineExtinction;
+}
+
+void StorePrimarySurfaceMetadata(
+    inout RayState rayState,
+    SurfaceInfo surfaceInfo,
+    float3 baseColor,
+    float3 diffuseColor,
+    float metalness,
+    float roughness,
+    uint materialClass)
+{
+    if (rayState.foundPrimarySurface)
+        return;
+
+    rayState.primaryBaseColor = baseColor;
+    rayState.primaryAlbedo = diffuseColor;
+    rayState.primaryNormal = surfaceInfo.normal;
+    rayState.primaryRoughness = max(roughness, 0.02);
+    rayState.primaryMetalness = metalness;
+    rayState.primaryOpacity = saturate(surfaceInfo.alpha);
+    rayState.primarySubsurface = saturate(surfaceInfo.subsurface);
+    rayState.primaryWorldPosition = surfaceInfo.position;
+    rayState.primaryViewDirection = rayState.rayDesc.Direction;
+    rayState.primaryThroughputAtHit = rayState.throughput;
+    rayState.primaryMaterialClass = materialClass;
+}
+
+void StorePrimarySurfaceDistanceAndMotion(
+    inout RayState rayState,
+    float hitDistance,
+    float3 position,
+    float3 previousPosition)
+{
+    if (rayState.foundPrimarySurface)
+        return;
+
+    rayState.distance = rayState.accumulatedDistance + hitDistance;
+    rayState.motion = position - previousPosition;
 }
 
 bool ContinueOpaquePath(
@@ -366,11 +707,37 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
 
     const bool isBlockBreakingOverlay = objectInstance.flags == (kObjectInstanceFlagAlphaTestThresholdHalf | kObjectInstanceFlagTextureAlphaControlsVertexColor);
 
+    bool isRainPuddleCandidate =
+        rayState.bounceCount == 0
+        && !rayState.foundPrimarySurface
+        && hitInfo.materialType == MATERIAL_TYPE_OPAQUE
+        && (objectInstance.flags & kObjectInstanceFlagChunk)
+        && surfaceInfo.emissive <= 0.001
+        && surfaceInfo.metalness < 0.5
+        && GetWeatherRainAmount() > 0.001
+        && GetWeatherSurfaceWetness() > 0.001;
+    float rainPuddleAmount = isRainPuddleCandidate
+        ? GetRainPuddleAmount(
+            surfaceInfo.position,
+            surfaceInfo.normal,
+            GetBlueNoise2D(rayState))
+        : 0.0;
+    if (rainPuddleAmount > 0.0) {
+        surfaceInfo.color *= lerp(1.0, 0.62, rainPuddleAmount * 0.55);
+        surfaceInfo.roughness =
+            lerp(surfaceInfo.roughness, 0.018, rainPuddleAmount);
+        surfaceInfo.subsurface *= 1.0 - rainPuddleAmount;
+    }
+
     float3 V = normalize(-rayState.rayDesc.Direction);
     float3 diffuseColor = surfaceInfo.color * (1.0 - surfaceInfo.metalness);
     float3 F0 = lerp((0.04).xxx, surfaceInfo.color, surfaceInfo.metalness);
     float originalRoughness = surfaceInfo.roughness;
     float roughness = max(originalRoughness, 0.035);
+    if (rainPuddleAmount > 0.0) {
+        F0 = lerp(F0, (0.02).xxx, rainPuddleAmount);
+        diffuseColor *= 1.0 - 0.32 * rainPuddleAmount;
+    }
     float NdotV = max(dot(surfaceInfo.normal, V), 0.0001);
 
     float3 sunDir = getOffsetTrueDirectionToSun();
@@ -390,6 +757,45 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
         bool isGlass = hitInfo.materialType != MATERIAL_TYPE_WATER
             && isGlassMedium
             && (surfaceInfo.alpha < 1.0 || hitInfo.materialType == MATERIAL_TYPE_ALPHA_TEST);
+
+#if MCRTX_PRIMARY_GUIDE_ONLY
+        if (isWater || isGlass) {
+            if (!rayState.foundPrimarySurface) {
+                uint materialClass = isWater
+                    ? kPrimaryMaterialWater
+                    : kPrimaryMaterialGlass;
+                StorePrimarySurfaceMetadata(
+                    rayState,
+                    surfaceInfo,
+                    surfaceInfo.color,
+                    diffuseColor,
+                    0.0,
+                    isWater ? WATER_INTERFACE_ROUGHNESS : originalRoughness,
+                    materialClass);
+                StorePrimarySurfaceDistanceAndMotion(
+                    rayState,
+                    hitInfo.rayT,
+                    surfaceInfo.position,
+                    surfaceInfo.prevPosition);
+                rayState.hitGlassPrimary = isGlass;
+                rayState.primaryDielectricSurfaceSeen = true;
+
+                if (surfaceInfo.emissive > 0.0) {
+                    rayState.primaryEmission +=
+                        surfaceInfo.color
+                        * surfaceInfo.emissive
+                        * PERF_TRANSLUCENT_EMISSIVE_SURFACE_INTENSITY
+                        * rayState.globalExposure
+                        * rayState.throughput;
+                }
+                rayState.foundPrimarySurface = true;
+            }
+
+            rayState.accumulatedDistance += hitInfo.rayT;
+            rayState.terminate = true;
+            return;
+        }
+#endif
         
         if (isBlockBreakingOverlay) {
             rayState.throughput *= surfaceInfo.color;
@@ -453,132 +859,20 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
                         skyAmbient = 0.0;
                     }
 
-                    int totalGlassLightCount =
-                        (int)g_view.cpuLightsCount;
-                    int glassCandidateCount = min(
-                        PERF_GLASS_LOCAL_LIGHT_IMPORTANCE_CANDIDATES,
-                        totalGlassLightCount);
-                    float glassCoverageWeight =
-                        GetStableLocalLightCoverageWeight(
-                            glassCandidateCount,
-                            totalGlassLightCount);
-                    float3 unshadowedLocalSpecular = 0.0;
-                    float3 selectedLightDirection = 0.0;
-                    float selectedLightDistance = 0.0;
-                    float selectedLightImportance = 0.0;
-                    float totalLightImportance = 0.0;
-                    float3 weightedLightDirection = 0.0;
-                    float weightedLightDistance = 0.0;
-                    bool hasSelectedLocalLight = false;
-
-                    [loop]
-                    for (int lightIndex = 0; lightIndex < glassCandidateCount; lightIndex++) {
-                        int selectedLightIndex =
-                            GetStableLocalLightCandidateIndex(
-                                lightIndex,
-                                glassCandidateCount,
-                                totalGlassLightCount);
-                        LightInfo lightInfo =
-                            inputLightsBuffer[selectedLightIndex];
-                        LightData lightData = UnpackLight(lightInfo.packedData);
-                        float3 toLight = lightInfo.position - surfaceInfo.position;
-                        float lightDistance = length(toLight);
-                        float3 lightDirection = toLight / max(lightDistance, 0.001);
-                        float NdotL = max(dot(surfaceInfo.normal, lightDirection), 0.0);
-                        if (NdotL <= 0.0)
-                            continue;
-
-                        float3 H = safeNormalize(V + lightDirection, surfaceInfo.normal);
-                        float NdotH = max(dot(surfaceInfo.normal, H), 0.0);
-                        float3 F = F_Schlick(
-                            max(dot(H, V), 0.0),
-                            dielectricF0Color);
-                        float D = D_GGX(
-                            NdotH, dielectricRoughness);
-                        float G = G_Smith(
-                            NdotV,
-                            NdotL,
-                            dielectricRoughness);
-                        float3 multipleScatter = FdezAgueraMultipleScattering(
-                            NdotV,
-                            NdotL,
-                            dielectricRoughness,
-                            dielectricF0Color);
-                        float3 specularBRDF = ((F * D * G)
-                            / max(4.0 * NdotV * NdotL, 0.001))
-                            + multipleScatter;
-
-                        float attenuation =
-                            GetEmissiveLightAttenuation(lightDistance);
-                        float lightIntensity =
-                            GetLocalLightIntensityWeight(lightData.intensity);
-                        float3 lightContrib = attenuation
-                            * lightIntensity * lightData.color
-                            * NdotL * PI
-                            * PERF_LOCAL_LIGHT_RADIANCE_SCALE;
-                        float3 lightSpecular =
-                            lightContrib * specularBRDF;
-                        unshadowedLocalSpecular += lightSpecular;
-
-                        float lightImportance =
-                            getLuminance(max(lightSpecular, (0.0).xxx));
-                        totalLightImportance += lightImportance;
-                        weightedLightDirection +=
-                            lightDirection * lightImportance;
-                        weightedLightDistance +=
-                            lightDistance * lightImportance;
-                        if (lightImportance > selectedLightImportance) {
-                            selectedLightImportance = lightImportance;
-                            selectedLightDirection = lightDirection;
-                            selectedLightDistance = lightDistance;
-                            hasSelectedLocalLight = true;
-                        }
-                    }
-
-                    if (hasSelectedLocalLight
-                        && totalLightImportance > 1.0e-6)
-                    {
-                        float3 representativeVector =
-                            weightedLightDirection
-                            / totalLightImportance;
-                        float representativeCoherence =
-                            saturate(length(representativeVector));
-                        float3 representativeDirection =
-                            safeNormalize(
-                                representativeVector,
-                                selectedLightDirection);
-                        float representativeDistance =
-                            weightedLightDistance
-                            / totalLightImportance;
-                        representativeDistance =
-                            max(representativeDistance,
-                                selectedLightDistance * 0.25);
-                        float representativeDominance =
-                            saturate(
-                                selectedLightImportance
-                                / max(totalLightImportance, 1.0e-6));
-
-                        RayDesc shadowRay;
-                        shadowRay.Origin = surfaceInfo.position
-                            + 1.0e-3 * surfaceInfo.normal;
-                        shadowRay.Direction = representativeDirection;
-                        shadowRay.TMin = 0.0;
-                        shadowRay.TMax =
-                            GetEmissiveLightShadowTMax(
-                                representativeDistance);
-
-                        ShadowPayload payload;
-                        TraceShadowRay(shadowRay, payload);
-
-                        localSpecular +=
-                            ApplyStableLocalLightGroupVisibility(
-                                unshadowedLocalSpecular,
-                                payload.transmission,
-                                representativeCoherence,
-                                representativeDominance,
-                                selectedLightImportance)
-                            * glassCoverageWeight;
-                    }
+                    float3 unusedLocalDiffuse;
+                    float3 tracedLocalSpecular;
+                    AccumulateShadowedPointLights(
+                        surfaceInfo.position,
+                        surfaceInfo.normal,
+                        V,
+                        dielectricF0Color,
+                        0.0.xxx,
+                        dielectricRoughness,
+                        0.0,
+                        GetBlueNoise2D(rayState),
+                        unusedLocalDiffuse,
+                        tracedLocalSpecular);
+                    localSpecular += tracedLocalSpecular;
                 }
                 
                 float3 emission =
@@ -649,6 +943,11 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
             if (totalInternalReflection) {
                 F = 1.0;
                 refrDir = reflDir;
+            } else if (isWater && dielectricPath == kDielectricPathRefract) {
+                float t = g_view.time * 2.0;
+                float3 noisePos = surfaceInfo.position * 0.5 + refrDir * 2.0;
+                float3 wobble = sin(noisePos * float3(2.5, 2.0, 2.2) + float3(-t, t, t*1.1));
+                refrDir = normalize(refrDir + wobble * 0.005);
             }
 
             float reflectionProbability = totalInternalReflection ? 1.0 : clamp(F, 0.1, 0.9);
@@ -735,6 +1034,19 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
             }
 
             if (isFirstVisibleGlass && isReflection) {
+                StorePrimarySurfaceMetadata(
+                    rayState,
+                    surfaceInfo,
+                    surfaceInfo.color,
+                    (1.0).xxx,
+                    0.0,
+                    isWater ? WATER_INTERFACE_ROUGHNESS : originalRoughness,
+                    kPrimaryMaterialFullTraced);
+                StorePrimarySurfaceDistanceAndMotion(
+                    rayState,
+                    hitInfo.rayT,
+                    surfaceInfo.position,
+                    surfaceInfo.prevPosition);
                 rayState.foundPrimarySurface = true;
                 rayState.primaryLobe = kPrimaryLobeSpecular;
                 rayState.primaryAlbedo = (1.0).xxx;
@@ -849,6 +1161,50 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
     float irradianceCacheBlend =
         irradianceCacheSample.confidence;
 
+#if MCRTX_PRIMARY_GUIDE_ONLY
+    if (!rayState.foundPrimarySurface) {
+        StorePrimarySurfaceMetadata(
+            rayState,
+            surfaceInfo,
+            surfaceInfo.color,
+            diffuseColor,
+            surfaceInfo.metalness,
+            originalRoughness,
+            kPrimaryMaterialOpaque);
+        StorePrimarySurfaceDistanceAndMotion(
+            rayState,
+            hitInfo.rayT,
+            surfaceInfo.position,
+            surfaceInfo.prevPosition);
+
+        float3 emission = 0.0;
+        if (surfaceInfo.emissive > 0.0)
+            emission = surfaceInfo.color
+                * surfaceInfo.emissive
+                * PERF_EMISSIVE_SURFACE_INTENSITY;
+        if (objectInstance.flags & kObjectInstanceFlagGlint)
+            emission += (sin(3.0 * g_view.time) * 0.5 + 0.5)
+                * (float3(077, 23, 255) / 255.0);
+        emission *= rayState.globalExposure;
+
+        rayState.primaryEmission += emission * rayState.throughput;
+        rayState.color += emission * rayState.throughput;
+        rayState.primaryCachedIrradiance =
+            irradianceCacheSample.irradiance * rayState.throughput;
+        rayState.primaryIrradianceCacheConfidence = irradianceCacheBlend;
+        rayState.diffuseIrradiance +=
+            irradianceCacheSample.irradiance
+            * rayState.throughput
+            * (irradianceCacheBlend
+                * PERF_IRRADIANCE_CACHE_PRIMARY_STRENGTH / PI);
+        rayState.foundPrimarySurface = true;
+    }
+
+    rayState.accumulatedDistance += hitInfo.rayT;
+    rayState.terminate = true;
+    return;
+#endif
+
     float3 directDiffuse = 0;
     float3 directSpecular = 0;
     float3 sunDiffuse = 0;
@@ -921,137 +1277,50 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
         outputBufferSunLightShadow[rayState.pixelCoord] = 0.0;
     }
     
-    int totalLightCount = (int)g_view.cpuLightsCount;
-    int localCandidateCap = rayState.bounceCount == 0
-        ? PERF_LOCAL_LIGHT_IMPORTANCE_CANDIDATES
-        : PERF_SECONDARY_LOCAL_LIGHT_IMPORTANCE_CANDIDATES;
-    int lightCount = min(localCandidateCap, totalLightCount);
-    float localLightCoverageWeight =
-        GetStableLocalLightCoverageWeight(lightCount, totalLightCount);
-    float3 unshadowedDirectDiffuse = 0.0;
-    float3 unshadowedDirectSpecular = 0.0;
-    float3 selectedLightDirection = 0.0;
-    float selectedLightDistance = 0.0;
-    float selectedLightImportance = 0.0;
-    float totalLightImportance = 0.0;
-    float3 weightedLightDirection = 0.0;
-    float weightedLightDistance = 0.0;
-    bool hasSelectedLocalLight = false;
+    AccumulateShadowedPointLights(
+        surfaceInfo.position,
+        surfaceInfo.normal,
+        V,
+        F0,
+        diffuseColor,
+        roughness,
+        surfaceInfo.subsurface,
+        GetBlueNoise2D(rayState),
+        directDiffuse,
+        directSpecular);
 
-    [loop]
-    for (int lightIndex = 0; lightIndex < lightCount; lightIndex++) {
-        int selectedLightIndex =
-            GetStableLocalLightCandidateIndex(
-                lightIndex,
-                lightCount,
-                totalLightCount);
-        LightInfo lightInfo =
-            inputLightsBuffer[selectedLightIndex];
-        LightData lightData = UnpackLight(lightInfo.packedData);
-
-        float3 toLight = lightInfo.position - surfaceInfo.position;
-        float lightDistance = length(toLight);
-        float3 lightDirection = toLight / max(lightDistance, 0.001);
-        float NdotL = max(dot(surfaceInfo.normal, lightDirection), 0.0);
-        if (NdotL <= 0.0)
-            continue;
-
-        float attenuation = GetEmissiveLightAttenuation(lightDistance);
-        float lightIntensity =
-            GetLocalLightIntensityWeight(lightData.intensity);
-        float3 H = safeNormalize(V + lightDirection, surfaceInfo.normal);
-        float NdotH = max(dot(surfaceInfo.normal, H), 0.0);
-        float LdotH = max(dot(lightDirection, H), 0.0);
-
-        float3 F = F_Schlick(max(dot(H, V), 0.0), F0);
-        float D = D_GGX(NdotH, roughness);
-        float G = G_Smith(NdotV, NdotL, roughness);
-        float3 multipleScatter = FdezAgueraMultipleScattering(
-            NdotV, NdotL, roughness, F0);
-        float3 specBRDF = ((F * D * G)
-            / (4.0 * max(NdotV * NdotL, 0.001))) + multipleScatter;
-
-        float3 diffuseBRDF = DisneyDiffuse(
-            NdotL, NdotV, LdotH, roughness, diffuseColor);
-        if (surfaceInfo.subsurface > 0.001) {
-            diffuseBRDF = lerp(
-                diffuseBRDF,
-                BurleyNormalizedSSS(
-                    NdotL, NdotV, LdotH, roughness, diffuseColor),
-                surfaceInfo.subsurface);
-        }
-        diffuseBRDF *= DiffuseEnergyWeight(F, multipleScatter);
-
-        float3 lightContrib = attenuation
-            * lightIntensity * lightData.color * NdotL * PI
-            * PERF_LOCAL_LIGHT_RADIANCE_SCALE
-            * 1.0;
-
-        float3 lightDiffuse = lightContrib * diffuseBRDF;
-        float3 lightSpecular = lightContrib * specBRDF;
-        unshadowedDirectDiffuse += lightDiffuse;
-        unshadowedDirectSpecular += lightSpecular;
-
-        float lightImportance =
-            getLuminance(max(lightDiffuse + lightSpecular, (0.0).xxx));
-        totalLightImportance += lightImportance;
-        weightedLightDirection +=
-            lightDirection * lightImportance;
-        weightedLightDistance +=
-            lightDistance * lightImportance;
-        if (lightImportance > selectedLightImportance) {
-            selectedLightImportance = lightImportance;
-            selectedLightDirection = lightDirection;
-            selectedLightDistance = lightDistance;
-            hasSelectedLocalLight = true;
-        }
-    }
-
-    if (hasSelectedLocalLight
-        && totalLightImportance > 1.0e-6)
+    if (rainPuddleAmount > 0.001
+        && rayState.bounceCount == 0
+        && !rayState.foundPrimarySurface)
     {
-        float3 representativeVector =
-            weightedLightDirection / totalLightImportance;
-        float representativeCoherence =
-            saturate(length(representativeVector));
-        float3 representativeDirection =
+        float3 puddleNormal =
             safeNormalize(
-                representativeVector,
-                selectedLightDirection);
-        float representativeDistance =
-            weightedLightDistance / totalLightImportance;
-        representativeDistance =
-            max(representativeDistance, selectedLightDistance * 0.25);
-        float representativeDominance =
-            saturate(
-                selectedLightImportance
-                / max(totalLightImportance, 1.0e-6));
-
-        RayDesc shadowRay;
-        shadowRay.Origin = surfaceInfo.position + 1.0e-3 * surfaceInfo.normal;
-        shadowRay.Direction = representativeDirection;
-        shadowRay.TMin = 0.0;
-        shadowRay.TMax = GetEmissiveLightShadowTMax(representativeDistance);
-
-        ShadowPayload payload;
-        TraceShadowRay(shadowRay, payload);
-
-        directDiffuse +=
-            ApplyStableLocalLightGroupVisibility(
-                unshadowedDirectDiffuse,
-                payload.transmission,
-                representativeCoherence,
-                representativeDominance,
-                selectedLightImportance)
-            * localLightCoverageWeight;
-        directSpecular +=
-            ApplyStableLocalLightGroupVisibility(
-                unshadowedDirectSpecular,
-                payload.transmission,
-                representativeCoherence,
-                representativeDominance,
-                selectedLightImportance)
-            * localLightCoverageWeight;
+                lerp(
+                    surfaceInfo.normal,
+                    GetWaterNormal(
+                        surfaceInfo.position,
+                        g_view.time,
+                        surfaceInfo.normal),
+                    saturate(rainPuddleAmount * 0.65)),
+                surfaceInfo.normal);
+        float puddleNdotV = max(dot(puddleNormal, V), 0.0001);
+        float puddleFresnel =
+            F_Schlick(puddleNdotV, (0.02).xxx).x;
+        float puddleReflectionWeight =
+            rainPuddleAmount
+            * max(
+                puddleFresnel * WATER_FRESNEL_BOOST,
+                PERF_WATER_MIN_REFLECTION_WEIGHT * 1.6)
+            * WEATHER_RAIN_PUDDLE_REFLECTION_STRENGTH;
+        float3 puddleReflection =
+            TraceDielectricReflectionProbe(
+                surfaceInfo.position,
+                puddleNormal,
+                reflect(-V, puddleNormal),
+                PERF_WATER_REFLECTION_PROBE_DISTANCE,
+                true)
+            * puddleReflectionWeight;
+        directSpecular += ClampIndirectRadiance(puddleReflection, 48.0);
     }
 
     float3 emission = 0;
@@ -1075,6 +1344,19 @@ void RenderVanilla(HitInfo hitInfo, inout RayState rayState)
     sunSpecular *= exposure;
     
     if (!rayState.foundPrimarySurface) {
+        StorePrimarySurfaceMetadata(
+            rayState,
+            surfaceInfo,
+            surfaceInfo.color,
+            diffuseColor,
+            surfaceInfo.metalness,
+            originalRoughness,
+            kPrimaryMaterialFullTraced);
+        StorePrimarySurfaceDistanceAndMotion(
+            rayState,
+            hitInfo.rayT,
+            surfaceInfo.position,
+            surfaceInfo.prevPosition);
         rayState.primaryAlbedo = diffuseColor;
         float3 primaryAlbedo = max(rayState.primaryAlbedo, 0.001);
         float3 primaryThroughput = rayState.throughput;

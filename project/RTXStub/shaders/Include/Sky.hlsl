@@ -33,6 +33,8 @@ static const float TERRAIN_SUN_ILLUMINANCE_LUX = 130000.0;
 static const float TERRAIN_FULL_MOON_ILLUMINANCE_LUX = 0.25;
 static const float TERRAIN_LUX_TO_ENGINE_RADIANCE = 1.0 / 30000.0;
 static const float3 TERRAIN_SOLAR_RGB_5778K = float3(1.0, 0.935, 0.74);
+static const float TERRAIN_DAY_CLEAR_LUMINANCE_SCALE = 0.90;
+static const float SKY_AMBIENT_DAY_CLEAR_LUMINANCE_SCALE = 0.92;
 
 static const float VL_FOG_MIN_DISTANCE = 96.0;
 static const float VL_FOG_TARGET_TRANSMITTANCE = 0.22;
@@ -333,6 +335,9 @@ float4 renderAuroraVolumetric(float3 rayOrigin, float3 rayDir, float dither, flo
 
 float3 RenderEngineSky(float3 viewDir, float3 sunDir, float3 moonDir)
 {
+    if (IsEndSky())
+        return 0.0;
+
     float3 color = CalcAtmosphericScatter(viewDir, sunDir);
     color += RenderMoonAndStars(viewDir, sunDir, moonDir);
 
@@ -351,6 +356,31 @@ float3 RenderEngineSky(float3 viewDir, float3 sunDir, float3 moonDir)
             + auroraColor.rgb * 0.85;
     }
 
+    float rainAmount = GetWeatherRainAmount();
+    if (rainAmount > 0.0) {
+        float dayAmount = GetDaySkyAmount(sunDir);
+        float rainNightAmount = GetNightAmount(sunDir);
+        float horizonAmount = 1.0 - smoothstep(0.05, 0.55, viewDir.y);
+        float3 rainGreyTint = GetWeatherRainPalette(rainNightAmount);
+        float rainyFloor =
+            lerp(0.013, 0.0011, rainNightAmount)
+            * (0.65 + 0.35 * horizonAmount)
+            * max(dayAmount + rainNightAmount, 0.15);
+        float3 rainySky =
+            max(
+                GetWeatherGreyRadiance(color, rainGreyTint),
+                rainGreyTint * rainyFloor);
+        color =
+            lerp(
+                color,
+                rainySky,
+                rainAmount * lerp(0.82, 0.96, rainNightAmount));
+        color *= lerp(
+            1.0,
+            GetWeatherRainLuminanceScale(rainNightAmount),
+            rainAmount);
+    }
+
     if (any(isnan(color)) || any(isinf(color))) {
         color = 0.0;
     }
@@ -365,8 +395,17 @@ float GetVolumetricFogMaxDistance()
 
 float GetRenderDistanceFogExtinction()
 {
-    return -log(VL_FOG_TARGET_TRANSMITTANCE)
+    float baseExtinction =
+        -log(VL_FOG_TARGET_TRANSMITTANCE)
         / max(GetVolumetricFogMaxDistance(), 1.0);
+    float rainAmount = GetWeatherRainAmount();
+    float nightAmount = GetNightAmount(getOffsetTrueDirectionToSun());
+    float rainMultiplier =
+        lerp(
+            WEATHER_RAIN_FOG_DENSITY_MULTIPLIER,
+            WEATHER_RAIN_NIGHT_FOG_DENSITY_MULTIPLIER,
+            nightAmount);
+    return baseExtinction * lerp(1.0, rainMultiplier, rainAmount);
 }
 
 float GetVolumetricFogDensity(bool inWater)
@@ -436,6 +475,11 @@ float3 GetAtmosphere(
     float3 lightColor,
     out float4 transmittance)
 {
+    if (IsEndSky()) {
+        transmittance = float4(1.0, 1.0, 1.0, 1.0);
+        return 0.0;
+    }
+
     rayDir = safeNormalize(rayDir, float3(0, 1, 0));
 
     float pathScale = rayLength > 1.0e20 ? 1.0 : saturate(rayLength * 0.004);
@@ -483,19 +527,42 @@ void GetSunColorAndLux(
     out float3 color,
     out float lux)
 {
+    if (IsEndSky()) {
+        lux = TERRAIN_SUN_ILLUMINANCE_LUX;
+        color =
+            (1.0).xxx
+            * (TERRAIN_SUN_ILLUMINANCE_LUX
+                * TERRAIN_LUX_TO_ENGINE_RADIANCE);
+        return;
+    }
+
     float3 transmittance = GetTerrainLightTransmittance(sunDir, 1.0);
     float3 spectralColor = TERRAIN_SOLAR_RGB_5778K * transmittance;
     float noonBoost =
-        lerp(1.0, 1.12, smoothstep(0.35, 0.90, sunDir.y));
+        lerp(1.0, 1.04, smoothstep(0.35, 0.90, sunDir.y));
+    float clearDayScale = TERRAIN_DAY_CLEAR_LUMINANCE_SCALE;
 
     lux =
         getLuminance(spectralColor)
         * TERRAIN_SUN_ILLUMINANCE_LUX
-        * noonBoost;
+        * noonBoost
+        * clearDayScale;
     color =
         spectralColor
         * (TERRAIN_SUN_ILLUMINANCE_LUX * TERRAIN_LUX_TO_ENGINE_RADIANCE)
-        * noonBoost;
+        * noonBoost
+        * clearDayScale;
+
+    float rainAmount = GetWeatherRainOnSurfaceAmount(pos);
+    if (rainAmount > 0.0) {
+        float dayAmount = GetDaySkyAmount(sunDir);
+        float3 greySun =
+            GetWeatherGreyRadiance(color, GetWeatherRainPalette(0.0));
+        float occludedScale =
+            lerp(1.0, lerp(0.055, 0.14, dayAmount), rainAmount);
+        color = lerp(color, greySun, rainAmount * 0.88) * occludedScale;
+        lux *= occludedScale;
+    }
 }
 
 void GetMoonColorAndLux(
@@ -505,6 +572,12 @@ void GetMoonColorAndLux(
     out float3 color,
     out float lux)
 {
+    if (IsEndSky()) {
+        color = 0.0;
+        lux = 0.0;
+        return;
+    }
+
     float3 transmittance = GetTerrainLightTransmittance(moonDir, 0.35);
     float3 spectralColor = moonDiskColor * transmittance;
 
@@ -512,6 +585,15 @@ void GetMoonColorAndLux(
     color =
         spectralColor
         * (TERRAIN_FULL_MOON_ILLUMINANCE_LUX * TERRAIN_LUX_TO_ENGINE_RADIANCE);
+
+    float rainAmount = GetWeatherRainOnSurfaceAmount(pos);
+    if (rainAmount > 0.0) {
+        float3 greyMoon =
+            GetWeatherGreyRadiance(color, float3(0.55, 0.58, 0.64));
+        float occludedScale = lerp(1.0, 0.18, rainAmount);
+        color = lerp(color, greyMoon, rainAmount * 0.92) * occludedScale;
+        lux *= occludedScale;
+    }
 }
 
 void GetSkyAmbientAndLux(
@@ -522,6 +604,12 @@ void GetSkyAmbientAndLux(
     out float3 color,
     out float lux)
 {
+    if (IsEndSky()) {
+        color = 0.0;
+        lux = 0.0;
+        return;
+    }
+
     float daySkyAmount = GetDaySkyAmount(sunDir);
     float sunAmount = GetSunAmount(sunDir);
     float3 ambientReferenceDir =
@@ -548,7 +636,10 @@ void GetSkyAmbientAndLux(
         (targetDayLux * TERRAIN_LUX_TO_ENGINE_RADIANCE)
         / max(dayChromaLuminance, 1.0e-6);
     float3 dayAmbient =
-        dayChroma * dayAmbientScale * validDayChroma;
+        dayChroma
+        * dayAmbientScale
+        * validDayChroma
+        * SKY_AMBIENT_DAY_CLEAR_LUMINANCE_SCALE;
 
     float3 nightAmbient =
         moonDiskColor
@@ -557,6 +648,18 @@ void GetSkyAmbientAndLux(
         * SKY_AMBIENT_NIGHT_SCALE;
 
     color = max(dayAmbient + nightAmbient, 0.0);
+    float rainAmount = GetWeatherRainOnSurfaceAmount(pos);
+    if (rainAmount > 0.0) {
+        float nightAmount = GetNightAmount(sunDir);
+        float3 rainyAmbient =
+            GetWeatherGreyRadiance(
+                color,
+                GetWeatherRainPalette(nightAmount));
+        float rainyScale = lerp(0.36, 0.09, nightAmount);
+        color =
+            lerp(color, rainyAmbient, rainAmount * 0.88)
+            * lerp(1.0, rainyScale, rainAmount);
+    }
     if (any(isnan(color)) || any(isinf(color))) {
         color = 0.0;
     }
@@ -571,6 +674,9 @@ float3 GetFogColor(
     float3 sunDir,
     float3 moonDir)
 {
+    if (IsEndSky())
+        return 0.0;
+
     float3 viewDir = safeNormalize(rayDir, float3(1, 0, 0));
     float3 horizonDir = safeNormalize(
         float3(viewDir.x, 0.0, viewDir.z),
@@ -593,11 +699,35 @@ float3 GetFogColor(
         * (TERRAIN_FULL_MOON_ILLUMINANCE_LUX * TERRAIN_LUX_TO_ENGINE_RADIANCE)
         * 32.0
         * pathScale;
-    return max(dayFog + nightFog, 0.0);
+    float3 fogColor = max(dayFog + nightFog, 0.0);
+    float rainAmount = GetWeatherRainAmount();
+    if (rainAmount > 0.0) {
+        float nightAmount = GetNightAmount(sunDir);
+        float3 rainPalette = GetWeatherRainPalette(nightAmount);
+        float3 rainFog =
+            GetWeatherGreyRadiance(
+                fogColor,
+                rainPalette);
+        float fogFloor =
+            lerp(0.010, 0.0008, nightAmount)
+            * smoothstep(0.0, GetVolumetricFogMaxDistance() * 0.34, fogDepth);
+        rainFog = max(
+            rainFog,
+            rainPalette * fogFloor);
+        fogColor = lerp(fogColor, rainFog, rainAmount * 0.92);
+        fogColor *= lerp(
+            1.0,
+            GetWeatherRainLuminanceScale(nightAmount),
+            rainAmount);
+    }
+    return fogColor;
 }
 
 float3 GetTransparentEnvironmentSky(float3 rayDir)
 {
+    if (IsEndSky())
+        return 0.0;
+
     float3 sunDir = getOffsetTrueDirectionToSun();
     float3 moonDir = getOffsetTrueDirectionToMoon();
     float3 envDir = safeNormalize(rayDir, float3(0, 1, 0));

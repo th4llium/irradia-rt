@@ -9,7 +9,7 @@
 #endif
 
 #ifndef VOLUMETRIC_CLOUD_LIGHT_STEPS
-#define VOLUMETRIC_CLOUD_LIGHT_STEPS 8
+#define VOLUMETRIC_CLOUD_LIGHT_STEPS 4
 #endif
 
 #ifndef VOLUMETRIC_CLOUD_STEPS
@@ -17,7 +17,7 @@
 #endif
 
 #ifndef VOLUMETRIC_CLOUD_SHADOW_STEPS
-#define VOLUMETRIC_CLOUD_SHADOW_STEPS 8
+#define VOLUMETRIC_CLOUD_SHADOW_STEPS 24
 #endif
 
 #ifndef VOLUMETRIC_CLOUD_BASE_HEIGHT
@@ -29,11 +29,11 @@
 #endif
 
 #ifndef VOLUMETRIC_CLOUD_COVERAGE
-#define VOLUMETRIC_CLOUD_COVERAGE 0.48
+#define VOLUMETRIC_CLOUD_COVERAGE 0.5
 #endif
 
 #ifndef VOLUMETRIC_CLOUD_DENSITY
-#define VOLUMETRIC_CLOUD_DENSITY 1.625
+#define VOLUMETRIC_CLOUD_DENSITY 2.0
 #endif
 
 #ifndef VOLUMETRIC_CLOUD_EROSION
@@ -80,12 +80,32 @@
 #define VOLUMETRIC_CLOUD_SHADOW_OD_CUTOFF 80.0
 #endif
 
+#ifndef VOLUMETRIC_CLOUD_NOISE_TEXTURE_SIZE
+#define VOLUMETRIC_CLOUD_NOISE_TEXTURE_SIZE 256.0
+#define VOLUMETRIC_CLOUD_DITHER_TEXTURE_SIZE 8.0
+#endif
+
+#ifndef VOLUMETRIC_CLOUD_NOISE_TEXELS_PER_TILE
+#define VOLUMETRIC_CLOUD_NOISE_TEXELS_PER_TILE 8.0
+#endif
+
+#ifndef VOLUMETRIC_CLOUD_DITHER_FRAME_OFFSET_X
+#define VOLUMETRIC_CLOUD_DITHER_FRAME_OFFSET_X 73u
+#endif
+
+#ifndef VOLUMETRIC_CLOUD_DITHER_FRAME_OFFSET_Y
+#define VOLUMETRIC_CLOUD_DITHER_FRAME_OFFSET_Y 17u
+#endif
+
 static const float VOLUMETRIC_CLOUD_EARTH_RADIUS = 6371000.0;
 static const float3 VOLUMETRIC_CLOUD_MOON_LIGHT_COLOR =
     float3(0.060, 0.075, 0.110);
 static const float VOLUMETRIC_CLOUD_TOP_HEIGHT =
     VOLUMETRIC_CLOUD_BASE_HEIGHT + VOLUMETRIC_CLOUD_THICKNESS;
 static const float VOLUMETRIC_CLOUD_RPI = 1.0 / PI;
+static const float VOLUMETRIC_CLOUD_NOISE_TILE =
+    VOLUMETRIC_CLOUD_NOISE_TEXTURE_SIZE
+    * VOLUMETRIC_CLOUD_NOISE_TEXELS_PER_TILE;
 
 struct VolumetricCloudSample
 {
@@ -105,17 +125,25 @@ float3 CloudAbsEpsilon(float3 x)
 
 float CloudNoise2D(float2 x)
 {
-    float2 p = x * 0.128;
-    float2 i = floor(p);
-    float2 f = frac(p);
-    float2 u = f * f * (3.0 - 2.0 * f);
+    float2 uv = frac(x / VOLUMETRIC_CLOUD_NOISE_TILE);
+    return blueNoiseTexture.SampleLevel(
+        linearWrapSampler,
+        float3(uv, 0.0),
+        0.0).r;
+}
 
-    float a = Hash21(i);
-    float b = Hash21(i + float2(1.0, 0.0));
-    float c = Hash21(i + float2(0.0, 1.0));
-    float d = Hash21(i + float2(1.0, 1.0));
-
-    return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
+float GetVolumetricCloudDither(uint2 pixelCoord)
+{
+    uint2 frameOffset = uint2(
+        (g_view.frameCount * VOLUMETRIC_CLOUD_DITHER_FRAME_OFFSET_X) & 255u,
+        (g_view.frameCount * VOLUMETRIC_CLOUD_DITHER_FRAME_OFFSET_Y) & 255u);
+    float2 uv =
+        (float2((pixelCoord + frameOffset) & 255u) + 0.5)
+        / VOLUMETRIC_CLOUD_NOISE_TEXTURE_SIZE;
+    return blueNoiseTexture.SampleLevel(
+        pointSampler,
+        float3(uv, 0.0),
+        0.0).r;
 }
 
 float CloudShape(float coverageNoise, float height01)
@@ -249,8 +277,12 @@ float3 EvaluateCloudTopScattering(float3 sunDirection)
     float3 absorbSun =
         CloudAbsEpsilon(absorbLight - absorbView)
         / CloudAbsEpsilon((scatterLight - scatterView) * ln2);
-    float3 mieScatter = Scatter(mieCoeff, opticalDepth) * 0.25;
-    float3 rayleighScatter = Scatter(rayleighCoeff, opticalDepth) * 0.375;
+    float3 mieScatter =
+        Scatter(mieCoeff, opticalDepth)
+        * MiePhaseSky(lDotU, opticalDepth);
+    float3 rayleighScatter =
+        Scatter(rayleighCoeff, opticalDepth)
+        * RayleighPhase(lDotU);
 
     return (mieScatter + rayleighScatter)
         * absorbSun
@@ -261,6 +293,9 @@ float3 EvaluateCloudTopScattering(float3 sunDirection)
 float GetVolumetricCloudDensityWorld(float3 position)
 {
 #if ENABLE_VOLUMETRIC_CLOUDS
+    if (IsEndSky())
+        return 0.0;
+
     float cloudHeight = GetVolumetricCloudCurvedHeight(position);
     if (cloudHeight < VOLUMETRIC_CLOUD_BASE_HEIGHT
         || cloudHeight > VOLUMETRIC_CLOUD_TOP_HEIGHT)
@@ -283,8 +318,14 @@ float GetVolumetricCloudDensityWorld(float3 position)
         (patternPosition.xz + spiralWarp) * scale
         + baseOffset
         + float2(-0.2, 0.3) * time);
+    float rainAmount = GetWeatherRainAmount();
+    float cloudCoverage =
+        lerp(
+            VOLUMETRIC_CLOUD_COVERAGE,
+            WEATHER_RAIN_CLOUD_COVERAGE,
+            rainAmount);
     float density = CloudShape(
-        baseNoise - 1.0 + VOLUMETRIC_CLOUD_COVERAGE * 2.0,
+        baseNoise - 1.0 + cloudCoverage * 2.0,
         height01);
 
     if (density <= 0.0)
@@ -308,7 +349,9 @@ float GetVolumetricCloudDensityWorld(float3 position)
         1.0);
     density *= smoothstep(0.0, 0.75, height01);
 
-    return sq(density) * VOLUMETRIC_CLOUD_DENSITY;
+    return sq(density)
+        * VOLUMETRIC_CLOUD_DENSITY
+        * lerp(1.0, 1.28, rainAmount);
 #else
     return 0.0;
 #endif
@@ -445,6 +488,9 @@ float GetVolumetricCloudShadowTransmission(
     float dither)
 {
 #if ENABLE_VOLUMETRIC_CLOUDS
+    if (IsEndSky())
+        return 1.0;
+
     if (GetLightAboveHorizonAmount(lightDirection) <= 0.0001)
         return 1.0;
 
@@ -453,11 +499,42 @@ float GetVolumetricCloudShadowTransmission(
         lightDirection,
         VOLUMETRIC_CLOUD_SHADOW_STEPS,
         dither);
+    float rainAmount = GetWeatherRainAmount();
+    float shadowStrength =
+        lerp(
+            VOLUMETRIC_CLOUD_TERRAIN_SHADOW_STRENGTH,
+            VOLUMETRIC_CLOUD_TERRAIN_SHADOW_STRENGTH * 2.75,
+            rainAmount);
     return exp(
-        -opticalDepth * VOLUMETRIC_CLOUD_TERRAIN_SHADOW_STRENGTH);
+        -opticalDepth * shadowStrength);
 #else
     return 1.0;
 #endif
+}
+
+float3 ApplyRainCloudLighting(
+    float3 scattering,
+    float cloudHeight,
+    float3 sunDirection)
+{
+    float rainAmount = GetWeatherRainAmount();
+    if (rainAmount <= 0.0)
+        return scattering;
+
+    float height01 = GetVolumetricCloudHeight01(cloudHeight);
+    float bottomToTop = smoothstep(0.18, 0.88, height01);
+    float nightAmount = GetNightAmount(sunDirection);
+    float sunWarmth =
+        GetSunAmount(sunDirection)
+        * smoothstep(0.20, 0.85, sunDirection.y)
+        * bottomToTop;
+    float rainShade =
+        lerp(0.015, 0.105, bottomToTop * sunWarmth)
+        * lerp(1.0, 0.42, nightAmount);
+    float3 rainPalette = GetWeatherRainPalette(nightAmount);
+    float3 rainScattering =
+        GetWeatherGreyRadiance(scattering, rainPalette) * rainShade;
+    return lerp(scattering, rainScattering, rainAmount);
 }
 
 float CloudPowderEffect(float density, float cosTheta)
@@ -566,7 +643,7 @@ float3 GetDirectVolumetricCloudScattering(
             * lightIntensity
         + totalScattering.y
             * skyLight
-            * VOLUMETRIC_CLOUD_RPI;
+            * PI;
 }
 
 float3 GetCloudSingleLightScattering(
@@ -617,6 +694,9 @@ void ComputeDirectVolumetricClouds(
     outInscatter = 0.0;
 
 #if ENABLE_VOLUMETRIC_CLOUDS
+    if (IsEndSky())
+        return;
+
     float3 worldOrigin = GetCloudStableWorldPosition(origin);
 
     float startDist;
@@ -739,6 +819,11 @@ void ComputeDirectVolumetricClouds(
                 VOLUMETRIC_CLOUD_MOON_INTENSITY * moonAmount);
         }
 
+        stepScattering =
+            ApplyRainCloudLighting(
+                stepScattering,
+                cloudHeight,
+                sunDirection);
         scatteringSum += stepScattering * transmittance;
         transmittance *= stepTransmittance;
     }
@@ -746,6 +831,17 @@ void ComputeDirectVolumetricClouds(
     float farBlend =
         saturate(startDist / max(VOLUMETRIC_CLOUD_MAX_RENDER_DISTANCE, 1.0));
     float3 skyFallback = skyColorNoSun * (1.0 - transmittance);
+    float rainAmount = GetWeatherRainAmount();
+    if (rainAmount > 0.0) {
+        float nightAmount = GetNightAmount(sunDirection);
+        skyFallback =
+            lerp(
+                skyFallback,
+                GetWeatherRainPalette(nightAmount)
+                    * (1.0 - transmittance)
+                    * lerp(0.010, 0.0008, nightAmount),
+                rainAmount);
+    }
 
     outTransmittance = transmittance;
     outInscatter =
@@ -771,6 +867,9 @@ VolumetricCloudSample EvaluateVolumetricCloudFroxel(
     result.extinction = 0.0;
 
 #if ENABLE_VOLUMETRIC_CLOUDS
+    if (IsEndSky())
+        return result;
+
     float3 worldPosition = GetCloudStableWorldPosition(position);
     float density = GetVolumetricCloudDensityWorld(worldPosition);
     if (density <= 0.00001)
@@ -806,6 +905,11 @@ VolumetricCloudSample EvaluateVolumetricCloudFroxel(
     sourceRadiance += skyAmbientRadiance
         * ambientWrap
         * (1.0 / PI);
+    sourceRadiance =
+        ApplyRainCloudLighting(
+            sourceRadiance,
+            GetVolumetricCloudCurvedHeight(worldPosition),
+            sunDirection);
 
     result.scattering = sourceRadiance * scattering;
     result.extinction = extinction;
